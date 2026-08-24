@@ -26,3 +26,6 @@ astra-sim-alibabacloud/inputs/topo/Rail_Opti_SingleToR_*
 *.swp
 *.swo
 *~
+
+# Windows download metadata
+*:Zone.Identifier

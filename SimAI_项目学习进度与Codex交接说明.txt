@@ -1,0 +1,485 @@
+SimAI 项目学习进度与 Codex 交接说明
+
+用途
+====
+这份文件用于把当前 ChatGPT 对话中的 SimAI 学习进度交接给 VSCode 内置 Codex。
+请把本文件视为当前项目的进度基线。不要从头重新安排，也不要直接跳到参数扫描或大规模实验。
+
+
+一、用户背景和协作要求
+======================
+
+1. 用户刚开始接触大模型训练系统、并行训练和网络仿真，必须按初学者视角解释。
+
+2. 出现新概念、新参数、新公式或新代码结构时，需要立即说明：
+   （1）它是什么；
+   （2）它从哪里来；
+   （3）它在当前流程中有什么作用；
+   （4）它会怎样影响后续结果。
+   不要默认用户已经学过相关术语。
+
+3. 学习方式必须沿着完整实验流程推进：
+   实验配置 → AICB 生成工作负载 → SimAI 读取和调度工作负载 → 通信/计算建模 → 输出 CSV → 分析实验。
+   不要把 TP、DP、PP、EP 等变量拆开，分别重复跑一遍完整流程。
+
+4. 所有实际操作都在 VSCode 的 WSL Ubuntu 终端中完成。
+   给终端命令时，每次只给一条，等待用户返回输出后再继续。
+   用户已经在正确目录时，不要在每条命令中重复加入 cd。
+
+5. 不要用测验或连续提问的方式检查学习效果。可以直接继续讲解。只有遇到会实质影响操作结果的缺失信息时才询问。
+
+6. 开始任何实验之前，必须先说明：
+   （1）本次实验要回答什么问题；
+   （2）哪些条件保持不变；
+   （3）改变什么；
+   （4）预期观察到什么；
+   （5）这一步最终要学会什么。
+
+7. 如果准备更换技术路线、分析路线或降低实验标准，必须先明确说明：
+   原路线有什么问题、为什么换路线、会影响哪些结果、不会影响哪些已有结果。
+
+8. 每日学习量不要无限延长，控制在约 5～6 小时。完成当天计划后应明确提醒停止。
+
+
+二、当前学习目标和合理范围
+========================
+
+相关项目：
+https://github.com/aliyun/SimAI/
+
+相关论文：
+SimAI: Unifying Architecture Design and Performance Tuning for Large-Scale Large Language Model Training with Scalability and Precision
+NSDI 2025
+https://www.usenix.org/system/files/nsdi25-wang-xizheng-simai.pdf
+
+老师只是让用户“看一下这个项目”。目前对任务目的的判断是：
+
+1. 了解 SimAI 要解决的问题和整体架构。
+2. 掌握工作负载、计算模拟、通信模拟和并行策略等共同语言。
+3. 跑通官方示例，知道输入和输出分别是什么。
+4. 能够自己生成一个较小的工作负载，并完成一次有明确研究问题的对比实验。
+5. 对 SimCCL 和 NS-3 知道其位置和作用，但当前不要求逐行理解全部实现。
+
+不应默认用户需要：
+
+1. 从头重新实现整个 SimAI。
+2. 立即读懂团队项目的全部源代码。
+3. 立即复现论文中的全部图表和数千 GPU 实验。
+4. 现在就深入编译和修改 NS-3。
+
+建议达到的复现层次：
+
+第一层：运行复现——已完成，官方 Analytical 示例已跑通。
+第二层：流程复现——正在进行，目标是自己从配置生成 workload，再交给 SimAI 运行。
+第三层：论文图表复现——只有老师明确要求时再做。
+第四层：从零实现整个系统——当前不属于学习目标。
+
+
+三、本地环境与仓库状态
+======================
+
+操作环境：VSCode + WSL2。
+当前 Linux：Ubuntu 24.04.3 LTS，x86_64。
+
+主要工具版本：
+gcc 13.3.0
+g++ 13.3.0
+Python 3.12.3
+Git 2.43.0
+CMake 3.28.3
+Ninja 1.11.1
+
+内存约 7.7 GiB，可用空间约 946 GiB。
+不要假设本机有可供实验使用的 GPU。
+
+项目目录：
+~/SimAI
+
+主仓库状态：
+master 分支，跟踪 origin/master。
+
+三个子模块已按主仓库固定版本完成初始化：
+
+SimCCL：fd7cd57d16f9bd42e3ccb70911c977e18ec294b9
+aicb：23eec3c48ca2d2d93dd888a4c7b22ab4421e782f
+ns-3-alibabacloud：3e0c7c1bfbbe9f77890ddcf5e5b9c79fc6dd7437
+
+已完成的仓库操作：
+
+git clone https://github.com/aliyun/SimAI.git
+git submodule update --init --recursive
+
+
+四、已经完成的构建和运行
+========================
+
+已经执行 Analytical 后端构建：
+
+./scripts/build.sh -c analytical
+
+构建过程中出现过多次：
+/etc/astra-sim Permission denied
+
+这是代码尝试向固定日志目录写入时产生的问题，但没有阻止 Analytical 二进制生成。构建最终显示：
+[100%] Built target SimAI_analytical
+
+二进制链接已确认存在：
+
+bin/SimAI_analytical
+
+它指向：
+/home/wjy/SimAI/astra-sim-alibabacloud/build/simai_analytical/build/simai_analytical/SimAI_analytical
+
+已经运行官方 Analytical 示例：
+
+./bin/SimAI_analytical -w ./example/workload_analytical.txt -g 9216 -nv 360 -nic 48.5 -n_p_s 8 -g_p_s 8 -r example-
+
+运行结束标志：
+SimAI-Analytical finished.
+
+输出文件：
+results/example-EndToEnd.csv
+
+注意：-r example- 是结果文件名前缀，结果默认写入 ./results/，不是仓库根目录。
+
+
+五、官方示例的关键结果
+======================
+
+结果汇总如下，时间单位为微秒：
+
+Expose DP comm：40332，占 0.53%
+Expose DP_EP comm：1067010，占 14.14%
+Expose TP comm：326686，占 4.33%
+Expose EP comm：1222811，占 16.21%
+Expose PP comm：0，占 0.00%
+bubble time：345984，占 4.59%
+total comp：4542795，占 60.20%
+total exposed comm：2656839，占 35.21%
+Total time：7545619 微秒，即约 7.545619 秒
+
+“exposed communication”指没有被计算重叠隐藏、真正增加总执行时间的通信时间。
+
+CSV 中某些没有通信的项目会显示 -nan 带宽。这是因为通信量为 0 时发生 0/0，并不表示整个仿真失败。
+
+时间单位已经从当前版本源码中核对：模拟时钟以纳秒为基础，CSV 输出时除以 1000，因此结果列中的时间是微秒。
+
+
+六、官方工作负载已经读到的内容
+==============================
+
+工作负载文件：
+example/workload_analytical.txt
+
+文件头：
+
+HYBRID_TRANSFORMER_FWD_IN_BCKWD model_parallel_NPU_group: 2 ep: 16 pp: 12 vpp: 8 ga: 24 all_gpus: 9216 checkpoints: 0 checkpoint_initiates: 0 pp_comm 50331648
+
+第二行：
+1789
+
+它表示后面共有 1789 条工作负载记录。
+
+第一条记录：
+
+grad_gather     -1      1       NONE    0       1       NONE    0       1       ALLGATHER       2807758848      100
+
+
+七、已经确认的并行关系和参数含义
+================================
+
+1. TP（Tensor Parallelism，张量并行）
+
+把同一层内部的大矩阵计算拆到多张 GPU 上。当前示例 TP=2，同一份张量计算由两张 GPU 协作完成，过程中通常需要 TP 组内通信。
+
+2. PP（Pipeline Parallelism，流水线并行）
+
+把模型的不同层分配给不同 GPU 阶段。当前示例 PP=12，即模型沿深度方向分成 12 个物理流水线阶段。相邻阶段需要传递激活或梯度。
+
+3. DP（Data Parallelism，数据并行）
+
+不同 DP 副本保存相同模型分片，但处理不同数据。每个副本得到的局部梯度不同，因此需要同步梯度，使各副本在更新后继续保持相同参数。
+
+当前 AICB/SimAI 代码使用：
+
+DP = all_gpus ÷（TP × PP）
+
+本例：
+
+DP = 9216 ÷（2 × 12）= 384
+
+EP 不再额外乘进 GPU 总数分解公式中。
+
+4. EP（Expert Parallelism，专家并行）
+
+用于 MoE 模型，把不同专家分到不同 GPU。当前 EP=16。它是在 DP 维度内部进一步组织专家相关通信，不是简单地在 TP、PP、DP 之外再乘一次。
+
+当前代码中，专家参数的数据并行通信组 DP_EP 大小为：
+
+DP_EP = DP ÷ EP = 384 ÷ 16 = 24
+
+5. GA（Gradient Accumulation，梯度累积）
+
+当前 ga=24，表示连续处理 24 个微批次并累积梯度，然后再进行一次参数更新。
+
+一般关系为：
+
+全局批量 GBS = 微批量 MBS × DP × GA
+
+因此：
+
+GA = GBS ÷（MBS × DP）
+
+工作负载文件头没有保留原始 GBS 和 MBS，所以不能只根据文件头反推出为什么配置恰好选择 24。它是 AICB 根据原始训练参数计算得到的。
+
+注意：本例中 GA=24，DP_EP 组大小也等于 24，只是数值巧合，二者不是同一概念。
+
+6. vpp=8
+
+项目文档把 VPP 描述为虚拟流水线相关参数，但当前固定版本的 AICB 代码在 PP>1 时，先把模型总层数除以 PP，再把每个物理 PP 阶段的层数写到工作负载头的 vpp 字段。
+
+因此本例 vpp=8 表示当前代码按每个物理流水线阶段 8 层进行计算。结合 PP=12，可对应 96 个 Transformer 层。
+
+不要仅凭名称把这里的 vpp=8 直接解释为“8 个虚拟流水线阶段”。讲解时必须以当前固定版本代码的实际用法为准。
+
+7. pp_comm=50331648
+
+50331648 字节等于 48 MiB，代表相邻流水线阶段之间传输的激活数据规模。
+
+AICB 中的基本计算形式是：
+
+2 × micro_batch_size × sequence_length × hidden_size
+
+系数 2 对应 BF16 数据每个元素 2 字节；开启 sequence parallel 时还会再按 TP 进行划分。
+
+8. checkpoints=0
+
+工作负载类型 HYBRID_TRANSFORMER_FWD_IN_BCKWD 支持在反向阶段重新执行一部分前向计算，即激活重计算/检查点机制。但本例 checkpoints=0，说明该示例没有真正启用检查点重计算。
+
+
+八、1789 条工作负载记录的来源
+=============================
+
+这不是随意写入的数字，而是 AICB 根据模型结构和训练步骤展开得到的。
+
+每个 GA 微批次包含：
+
+1 条 embedding_layer
+8 个 Transformer 层
+每层包含 1 条 attention_column、1 条 attention_row 和 7 条 mlp_moelayer，共 9 条
+1 条 final
+
+所以每个微批次：
+
+1 + 8 × 9 + 1 = 74 条
+
+GA=24：
+
+74 × 24 = 1776 条
+
+再加前置 6 条：
+
+grad_gather
+grad_param_comm
+grad_param_compute
+embedding_grads
+moe_grad_norm1
+moe_grad_norm2
+
+再加结尾 7 条：
+
+3 条 cross_entropy
+4 条 optimizer
+
+总计：
+
+1776 + 6 + 7 = 1789 条
+
+
+九、工作负载单行格式
+====================
+
+当前 AICB 的 Work_Item 会输出 12 个字段：
+
+1. name：操作或层名称
+2. placeholder：当前通常写 -1
+3. forward_compute：前向计算时间
+4. forward_comm：前向通信类型
+5. forward_comm_size：前向通信数据量
+6. backward_compute：反向输入梯度相关计算时间
+7. backward_comm：反向输入梯度相关通信类型
+8. backward_comm_size：对应通信数据量
+9. dp_compute：权重梯度/数据并行阶段计算时间
+10. dp_comm：权重梯度/数据并行通信类型
+11. dp_comm_size：对应通信数据量
+12. process_time：当前生成器通常写 100
+
+SimAI 的 Workload.cc 把第二项命名为 depen，但当前开源固定版本只读取和打印它，没有利用它建立显式依赖图。因此当前文件中的 -1 更接近占位符，不能仅根据论文中的“依赖关系”描述就宣称它已经参与了依赖调度。
+
+还要注意：AICB 输出字段的阶段叫法和最终 CSV 中 fwd、wg、ig 的显示顺序不完全一致。解释结果时需要依据解析代码做映射，不能只看列名猜测。
+
+
+十、目前理解的完整代码和实验流程
+================================
+
+第一阶段：设置训练实验参数
+
+指定模型规模、层数、隐藏维度、批量大小、TP、PP、EP、GPU 总数、硬件带宽等。这些参数描述“想模拟怎样的一次大模型训练”。
+
+第二阶段：AICB 生成工作负载
+
+AICB 不执行真实的大规模训练，而是构造一个 mocked model，根据模型层和并行策略生成计算与通信操作序列，写成 workload 文本文件。
+
+主要入口：
+aicb/workload_generator/SimAI_training_workload_generator.py
+
+主流程：
+
+get_params()
+→ 根据框架创建 MegatronModel 或 DeepSeekV3Model
+→ 创建 SIMAI_workload
+→ workload_generate() 或 workload_generate_aiob()
+→ dump_file()
+
+当前阶段优先使用不需要 GPU 的普通 workload_generate() 路线，不开启 AIOB 实测计算时间路线。
+
+AICB 参数处理中的关键代码位于：
+aicb/utils/utils.py
+
+其中当前版本会计算：
+
+dp_num = world_size //（tensor_model_parallel_size × pipeline_model_parallel）
+
+num_microbatches = global_batch_size //（dp_num × micro_batch_size）
+
+当 PP>1 时，还会把 num_layers 除以 PP，得到当前物理流水线阶段所包含的层数。
+
+第三阶段：SimAI 读取工作负载
+
+Analytical 主入口：
+astra-sim-alibabacloud/astra-sim/network_frontend/analytical/AnalyticalAstra.cc
+
+工作负载解析：
+astra-sim-alibabacloud/astra-sim/workload/Workload.cc
+
+它读取文件头、记录总数和每一条操作，把通信字符串映射为通信类型和通信组类型，并构造 Layer 对象。
+
+第四阶段：建立层和通信组信息
+
+主要代码：
+astra-sim-alibabacloud/astra-sim/workload/Layer.cc
+
+这里会根据 TP、PP、DP、EP 决定不同操作应该在哪个通信组内执行。例如：
+
+普通 TP 通信使用 TP 组。
+EP 通信使用 EP 组。
+普通数据并行通信使用 DP 组。
+专家参数的数据并行通信使用 DP/EP 组，即 DP_EP。
+
+第五阶段：选择后端进行模拟
+
+Analytical 路线：根据消息大小、通信组规模、带宽等参数，用解析模型估计通信时间，速度较快，已经跑通。
+
+Simulation 路线：进一步使用 SimCCL 描述集合通信算法，并使用 NS-3 模拟更细的网络行为，速度更慢、实现更复杂，放到后续了解。
+
+第六阶段：计算与通信按依赖关系推进
+
+计算操作与通信操作不是简单地两个程序完全独立并行运行。SimAI 按当前训练操作的前后关系触发事件；当某些计算和通信在依赖关系上允许重叠时，它们才可能同时推进。通信完成又会触发后续操作。
+
+第七阶段：输出结果
+
+主要代码：
+astra-sim-alibabacloud/astra-sim/workload/CSVWriter.cc
+以及 Layer::report
+
+输出包括总计算时间、暴露通信时间、流水线气泡时间、总时间，以及各层不同阶段的计算和通信统计。
+
+
+十一、已经讲过的基础概念
+==========================
+
+此前已经从初学者角度讲过以下内容，但后续结合代码时仍应简要提醒其在当前步骤中的具体作用：
+
+大模型训练的前向传播和反向传播
+梯度为什么需要同步
+AllReduce 求和/平均后得到的含义
+DP、TP、PP、EP
+计算模拟器和通信模拟器
+依赖关系以及允许计算通信重叠的条件
+Chakra
+PyTorch Execution Trace
+PyTorch trace generator
+NS-3
+OMNeT++
+GPGPU-Sim
+ASTRA-sim
+SimAI 论文中的整体架构图
+
+不要重复进行大段脱离代码的概念教学。后续应在这些概念进入实际流程时，把概念和对应代码、输入、输出联系起来。
+
+
+十二、当前阶段与下一步任务
+========================
+
+当前总进度：
+
+1. 论文整体背景和架构：已完成第一轮学习。
+2. 克隆项目、初始化子模块：已完成。
+3. 构建并运行官方 Analytical 示例：已完成。
+4. 理解官方 workload 文件头、记录结构和结果 CSV：已完成初步分析。
+5. 学习 AICB 从训练配置生成 workload 的完整流程：正在进行。
+6. 学习 SimAI 的解析和事件推进：尚未系统进行。
+7. 学习 Analytical 通信估算与调度：尚未系统进行。
+8. 完成一个有明确目的的控制变量实验：尚未开始，应放在理解主流程之后。
+9. SimCCL + NS-3 完整仿真路线：后续只做整体了解，除非老师另有要求。
+
+下一步不要立刻修改 NIC 带宽或逐个测试 TP、DP、PP、EP。
+
+下一步的明确目标是：
+
+沿着 AICB 的一次完整执行，理解“训练配置怎样被转换成 mocked model，再怎样展开成 workload 文本”，然后在 CPU 环境中生成一个规模较小、便于阅读的 workload。
+
+完成标准：
+
+1. 知道 AICB 的入口命令和参数来源。
+2. 知道模型对象如何组织 embedding、attention、MLP/MoE、final 等结构。
+3. 知道 workload_generate() 如何按 GA 和模型层展开记录。
+4. 成功生成一个新的小型 workload 文件。
+5. 能把这个文件交给已经编译好的 SimAI_analytical 运行。
+
+执行这一阶段前应先只读检查 AICB 的 README、参数定义和 Python 依赖，确认 Python 3.12 是否兼容。若需要安装依赖，优先在 aicb 目录建立独立虚拟环境，避免污染系统 Python；必须先解释环境和依赖的作用，再给安装命令。
+
+当前不使用需要真实 GPU 测量计算时间的 AIOB 路线，不使用 Docker，也不编译 NS-3。
+
+
+十三、后续教学顺序
+==================
+
+按以下顺序继续，不要随意跳转：
+
+1. AICB：配置 → mocked model → workload_generate → dump_file。
+2. 生成一个小型 workload，并逐段解释它为什么会形成这些记录。
+3. SimAI：Workload.cc 如何读入该文件并构造 Layer。
+4. SimAI：事件如何按前向、反向、通信依赖推进，以及什么时候能够重叠。
+5. Analytical：消息大小、通信组规模、带宽怎样共同决定通信时间。
+6. CSVWriter：各项结果怎样产生，怎样判断瓶颈。
+7. 设计一次有明确研究问题的控制变量实验。
+8. 最后再概览 SimCCL 和 NS-3 在完整仿真路线中的作用。
+
+
+十四、给 VSCode Codex 的直接要求
+==============================
+
+请先基于当前固定版本的本地代码进行只读检查，不要用网上最新分支的行为替代本地固定提交的行为。
+
+接下来从“AICB 主入口到 workload 文件生成”这一完整流程开始。先说明本阶段的目的和完成标准，再检查相关 README、参数定义及依赖。之后每次只给用户一条可以在当前 VSCode WSL 终端执行的命令，并在命令执行前解释命令为什么要运行、预期看到什么。
+
+不要重新克隆仓库，不要重新初始化子模块，不要重新构建已经成功的 Analytical 后端，不要现在开始参数扫描，不要把项目拆成若干孤立变量反复运行。
+
+如果本地代码显示的行为与论文描述、README 或变量名称不一致，应明确区分：
+
+1. 论文中的设计概念；
+2. README 的项目说明；
+3. 当前固定版本源码的实际行为。
+
+最终解释以当前固定版本源码的实际行为为准，同时指出差异。

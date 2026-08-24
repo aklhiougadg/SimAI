@@ -47,8 +47,8 @@ struct NetWorkParam{
   uint32_t switch_num;
   uint32_t link_num;
   uint32_t trace_num;
-  uint32_t nvswitch_num;
-  uint32_t gpus_per_server;
+  uint32_t nvswitch_num;                        // NVSwitch数量
+  uint32_t gpus_per_server;                     // 每台服务器的GPU数量
   uint32_t nics_per_server;
   float nvlink_bw = -1.0;
   float bw_per_nic = -1.0;
@@ -59,7 +59,7 @@ struct NetWorkParam{
   float ep_overlap_ratio = 0;
   float pp_overlap_ratio = 1;
   GPUType gpu_type;
-  std::vector<int>NVswitchs;
+  std::vector<int>NVswitchs;                    // NVSwitch节点编号
   std::vector<std::vector<int>>all_gpus;
 };
 

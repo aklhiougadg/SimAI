@@ -117,8 +117,8 @@ Sys::~Sys() {
 }
 
 Sys::Sys(
-    AstraNetworkAPI* NI,
-    AstraMemoryAPI* MEM,
+    AstraNetworkAPI* NI,                     // 网络接口对象，负责模拟网络通信
+    AstraMemoryAPI* MEM,                     // 内存接口对象，负责模拟内存访问和数据传输
     int id,
     int npu_offset,
     int num_passes,
@@ -139,17 +139,17 @@ Sys::Sys(
     std::vector<int>_all_gpus,
     std::vector<int>_NVSwitchs,
     int _ngpus_per_node) {
-  scheduler_unit = nullptr;
-  vLevels = nullptr;
-  memBus = nullptr;
-  workload = nullptr;
-  offline_greedy = nullptr;
+  scheduler_unit = nullptr;                     // 调度器单元，负责管理待执行的集合通信任务
+  vLevels = nullptr;                            // 队列层级结构，管理不同层级的通信队列
+  memBus = nullptr;                             // 内存总线对象，负责模拟内存访问和数据传输
+  workload = nullptr;                           // 工作负载对象，表示当前模拟的工作负载
+  offline_greedy = nullptr;                     // 离线贪心调度器对象，用于优化集合通信任务的调度
   this->initialized = false;
   this->intra_dimension_scheduling = IntraDimensionScheduling::FIFO;
   this->inter_dimension_scheduling = InterDimensionScheduling::Ascending;
-  round_robin_inter_dimension_scheduler = 0;
-  this->last_scheduled_collective = 0;
-  this->dim_to_break = -1;
+  round_robin_inter_dimension_scheduler = 0;    // 轮询调度器，用于在不同维度之间进行轮询调度
+  this->last_scheduled_collective = 0;          // 最近一次被调度的集合通信编号
+  this->dim_to_break = -1;                      // 需要中断的维度编号，-1表示没有需要中断的维度
 
   start_sim_time = std::chrono::high_resolution_clock::now();
   this->NI = NI;
@@ -201,14 +201,14 @@ Sys::Sys(
         "Unable to initialize the system layer because the file can not be openned");
   }
 
-  this->pending_events = 0;
+  this->pending_events = 0;                // 当前系统中待处理的事件数量，用于跟踪系统的负载情况
 
-  int total_disabled = 0;
+  int total_disabled = 0;                  // 当前系统中被禁用的队列数量，用于统计系统的可用资源
   this->physical_dims = physical_dims;
   this->queues_per_dim = queues_per_dim;
-  int element = 0;
-  all_queues = 0;
-  total_nodes = 1;
+  int element = 0;                         // 当前正在初始化的队列编号
+  all_queues = 0;                          // 当前系统中总的队列数量
+  total_nodes = 1;                         // 当前系统中总的节点数量
   for (int current_dim = 0; current_dim < queues_per_dim.size();
        current_dim++) {
     all_queues += queues_per_dim[current_dim];
@@ -224,7 +224,7 @@ Sys::Sys(
       total_nodes *= physical_dims[current_dim];
     }
     for (int j = 0; j < queues_per_dim[current_dim]; j++) {
-      std::list<BaseStream*> temp;
+      std::list<BaseStream*> temp;            // BaseStream表示一个等待调度或正在执行的通信任务
       active_Streams[element] = temp;
       std::list<int> pri;
       stream_priorities[element] = pri;
@@ -235,6 +235,7 @@ Sys::Sys(
     NI->enabled = false;
     std::cout << "Node " << id << " has been totally disabled" << std::endl;
   }
+  // 计算并发流数量
   concurrent_streams =
       (int)std::ceil(((double)active_chunks_per_dimension) / queues_per_dim[0]);
   active_first_phase = 100000000;
@@ -244,6 +245,7 @@ Sys::Sys(
         << concurrent_streams * queues_per_dim[0] << std::endl;
   }
   max_running = 100000000;
+  // 初始化调度器单元和队列层级结构
   scheduler_unit = new SchedulerUnit(
       this,
       queues_per_dim,
@@ -260,7 +262,7 @@ Sys::Sys(
       id, physical_dims, all_gather_implementation_per_dimension);
   logical_topologies["AllToAll"] = new GeneralComplexTopology(
       id, physical_dims, all_to_all_implementation_per_dimension);
-  stream_counter = 0;
+  stream_counter = 0;                  // 通信流编号计数器
   if (id == 0) {
     std::atexit(exiting);
     std::cout << "total nodes: " << total_nodes << std::endl;

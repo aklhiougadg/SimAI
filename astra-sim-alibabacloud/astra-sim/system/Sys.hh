@@ -89,7 +89,7 @@ class Sys : public Callable {
   int finished_workloads;
   int id;
   int npu_offset;
-  int nvswitch_id; 
+  int nvswitch_id;
   int num_gpus;
   std::vector<int>NVSwitchs; 
   int ngpus_per_node;

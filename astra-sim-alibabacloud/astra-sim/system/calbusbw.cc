@@ -282,8 +282,8 @@ void printData(const std::vector<std::vector<std::string>> &data) {
 
 
 BusBwResult cal_busbw(GPUType node_type,float bw_intra,float bw_per_nic, float nics_pernode,int node_count,char* coll_type,int gpus_pernode,char* nic_type) {
-    BusBwResult result;
-    CalculationParameters params;
+    BusBwResult result;                          // 最终计算出的带宽和瓶颈位置
+    CalculationParameters params;                // 输入参数
     memset(&params, 0, sizeof(params));
     retcode = 0;
     params.node_count = node_count;
@@ -293,7 +293,7 @@ BusBwResult cal_busbw(GPUType node_type,float bw_intra,float bw_per_nic, float n
     params.bw_per_nic = bw_per_nic;
     params.bw_intra = bw_intra;
     params.group_split_mask = 0;
-    params.nccl_algo = "ring";
+    params.nccl_algo = "ring";                   // 默认使用ring算法(逻辑上成环)
     params.cross_nic = 2;
     params.coll_type = coll_type;
     params.node_type = node_type;
@@ -305,7 +305,7 @@ BusBwResult cal_busbw(GPUType node_type,float bw_intra,float bw_per_nic, float n
     // for (int i = 1; i < argc; i++){
     //     parseParams(argc, argv, &i, &params);
     // }
-    params.real_nics_pernode = (float)params.nics_pernode;
+    params.real_nics_pernode = (float)params.nics_pernode;   // 带宽公式实际采用的每服务器网卡数
 
     if (params.node_count < 1) {
         strcpy(info, "Error: The number of nodes must be greater than 0.");

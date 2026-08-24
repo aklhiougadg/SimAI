@@ -74,8 +74,8 @@ int main(int argc,char *argv[]) {
   param->mode = ModeType::ANALYTICAL;
   physical_dims = {param->gpus};
   // AnaInit(argc, argv);
-  uint32_t using_num_gpus = 0;
-  uint32_t all_gpu_num = param->gpus[0];
+  uint32_t using_num_gpus = 0;                    // 当前累计的模拟节点数
+  uint32_t all_gpu_num = param->gpus[0];          // 实际的GPU数量
   for (auto &a : physical_dims) {
     int job_npus = 1;
     for (auto &dim : a) {
@@ -83,7 +83,7 @@ int main(int argc,char *argv[]) {
     }
     using_num_gpus += job_npus;
   }
-  std::map<int, int> node2nvswitch; //
+  std::map<int, int> node2nvswitch;
   for(int i = 0; i < all_gpu_num; ++ i) {
     node2nvswitch[i] = all_gpu_num + i / param->net_work_param.gpus_per_server;
   }
@@ -95,7 +95,7 @@ int main(int argc,char *argv[]) {
   physical_dims[0][0] += param->net_work_param.nvswitch_num;
   using_num_gpus += param->net_work_param.nvswitch_num;
 
-  std::vector<int> queues_per_dim(physical_dims[0].size(), 1);
+  std::vector<int> queues_per_dim(physical_dims[0].size(), 1);       // 每个维度的队列数量，初始化为1，表示每个维度只有一个通信队列
   int job_npus = 1;
   for (auto dim : physical_dims[0]) {
       job_npus *= dim;

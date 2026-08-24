@@ -38,17 +38,17 @@ Workload::Workload(
     std::string path,
     bool seprate_log) {
   this->initialized = false;
-  this->layers = nullptr;
-  this->SIZE = 0;
-  this->counter = 0;
-  this->delay_loaded = false;
+  this->layers = nullptr;                          // 工作负载中的执行记录数组
+  this->SIZE = 0;                                  // 工作负载中执行记录的数量
+  this->counter = 0;                               // 当前阶段还需等待的模拟时间
+  this->delay_loaded = false;                      // 标记是否已加载延迟信息
   this->checkpoint_initiated = false;
   this->collective_issued = false;
   this->current_state = LoopState::Forward_Pass;
-  this->generator = generator;
+  this->generator = generator;                     // sys
   this->TOTAL_PASS = TOTAL_PASS;
   this->pass_counter = 0;
-  this->index = 0;
+  this->index = 0;                                 // 当前正在处理的执行记录索引
   this->waiting_for_comm = 0;
   end_to_end = nullptr;
   detailed = nullptr;
@@ -1117,8 +1117,8 @@ std::map<std::string, std::vector<bool>> Workload::decode_involved_dimensions(
       policy == ParallelismPolicy::Transformer) {
     int model_parallel_boundary =
         generator->break_dimension(model_parallel_npu_group);
-    std::vector<bool> model;
-    std::vector<bool> data;
+    std::vector<bool> model;                                   // 标记哪些维度用于同一层的多GPU协作
+    std::vector<bool> data;                                    // 标记哪些维度用于不同层的多GPU协作
     for (int i = 0; i <= model_parallel_boundary; i++) {
       model.push_back(true);
       data.push_back(false);
@@ -1156,7 +1156,7 @@ bool Workload::initialize_workload(std::string name) {
   // std::cout << "First line is : '" << firstline << "'" << std::endl;
   std::istringstream iss(firstline);
   std:string token;
-  std::vector<std::string> tokens;
+  std::vector<std::string> tokens;           // 把workload文件第一行按空格拆分后得到的字符串数组
   // bool findparallesimPolcy = false;
   
   while (iss >> token) {
@@ -1254,7 +1254,7 @@ bool Workload::initialize_workload(std::string name) {
   }
   std::map<std::string, std::vector<bool>> general_involved_dimensions =
       decode_involved_dimensions(parallelismPolicy, model_parallel_npu_group);
-  pp_commsize = 0;
+  pp_commsize = 0;                      // 相邻模型阶段之间一次传输的数据量
   for (size_t i = 1; i < tokens.size(); i = i+1){
     if(tokens[i]=="pp_comm"||tokens[i]=="pp_comm:"){
       pp_commsize = std::stoi(tokens[i+1]);
@@ -1281,36 +1281,36 @@ bool Workload::initialize_workload(std::string name) {
   SIZE = lines;
   layers = new Layer*[SIZE];
   for (int i = 0; i < lines; i++) {
-    std::string id;
+    std::string id;                    // 记录的操作名称
     inFile >> id;
-    int depen;
+    int depen;                         // 该记录依赖的前置操作的数量
     inFile >> depen;
 
-    Tick fp_compute_time;
+    Tick fp_compute_time;              // 该记录的前向计算时间
     inFile >> fp_compute_time;
-    std::string fp_comm_type_s;
+    std::string fp_comm_type_s;        // 该记录的前向通信类型
     inFile >> fp_comm_type_s;
-    uint64_t fp_comm_size;
+    uint64_t fp_comm_size;             // 该记录的前向通信数据量
     inFile >> fp_comm_size;
 
-    Tick ig_compute_time;
+    Tick ig_compute_time;              // 该记录的输入梯度计算时间
     inFile >> ig_compute_time;
-    std::string ig_comm_type_s;
+    std::string ig_comm_type_s;        // 该记录的输入梯度通信类型
     inFile >> ig_comm_type_s;
-    uint64_t ig_comm_size;
+    uint64_t ig_comm_size;             // 该记录的输入梯度通信数据量
     inFile >> ig_comm_size;
 
-    Tick wg_compute_time;
+    Tick wg_compute_time;              // 该记录的权重梯度计算时间
     inFile >> wg_compute_time;
-    std::string wg_comm_type_s;
+    std::string wg_comm_type_s;        // 该记录的权重梯度通信类型
     inFile >> wg_comm_type_s;
-    uint64_t wg_comm_size;
+    uint64_t wg_comm_size;             // 该记录的权重梯度通信数据量
     inFile >> wg_comm_size;
-    Tick wg_update_time;
+    Tick wg_update_time;               // 该记录的末尾处理时间
     inFile >> wg_update_time;
 
     ParallelismPolicy specific_policy = ParallelismPolicy::None;
-    std::map<std::string, std::vector<bool>> selected_involved_dimensions;
+    std::map<std::string, std::vector<bool>> selected_involved_dimensions;    // 当前记录的通信涉及的维度
     ComType fp_type = ComType::None;
     ComType ig_type = ComType::None;
     ComType wg_type = ComType::None;
