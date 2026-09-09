@@ -29,3 +29,5 @@ astra-sim-alibabacloud/inputs/topo/Rail_Opti_SingleToR_*
 
 # Windows download metadata
 *:Zone.Identifier
+
+aicb/.venv/

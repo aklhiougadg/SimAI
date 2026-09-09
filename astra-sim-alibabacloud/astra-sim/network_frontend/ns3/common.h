@@ -109,7 +109,7 @@ unordered_map<uint64_t, double> rate2pmax;
 
 std::ifstream topof, flowf, tracef;
 
-NodeContainer n;
+NodeContainer n;                     // 保存整个物理拓扑中所有节点的容器
 
 uint64_t nic_rate;
 
@@ -128,12 +128,12 @@ struct Interface {
   Interface() : idx(0), up(false) {}
 };
 map<Ptr<Node>, map<Ptr<Node>, Interface>> nbr2if;
-map<Ptr<Node>, map<Ptr<Node>, vector<Ptr<Node>>>> nextHop;
-map<Ptr<Node>, map<Ptr<Node>, uint64_t>> pairDelay;
-map<Ptr<Node>, map<Ptr<Node>, uint64_t>> pairTxDelay;
-map<uint32_t, map<uint32_t, uint64_t>> pairBw;
-map<Ptr<Node>, map<Ptr<Node>, uint64_t>> pairBdp;
-map<uint32_t, map<uint32_t, uint64_t>> pairRtt;
+map<Ptr<Node>, map<Ptr<Node>, vector<Ptr<Node>>>> nextHop;    // 保存某节点去往某个目的GPU时的候选下一跳
+map<Ptr<Node>, map<Ptr<Node>, uint64_t>> pairDelay;           // 保存两个端点之间的累计传播延迟
+map<Ptr<Node>, map<Ptr<Node>, uint64_t>> pairTxDelay;         // 保存标准数据块经过整条路径的累计序列化时间
+map<uint32_t, map<uint32_t, uint64_t>> pairBw;                // 保存路径瓶颈带宽
+map<Ptr<Node>, map<Ptr<Node>, uint64_t>> pairBdp;             // 根据RTT和带宽计算出的BDP（网络中最多可容纳的在途数据量）
+map<uint32_t, map<uint32_t, uint64_t>> pairRtt;               // 保存两个端点之间的RTT
 
 struct FlowInput {
   uint32_t src, dst, pg, maxPacketCount, port, dport;
@@ -240,11 +240,11 @@ void schedule_monitor(){
 }
 
 void CalculateRoute(Ptr<Node> host) {
-  vector<Ptr<Node>> q;
-  map<Ptr<Node>, int> dis;
-  map<Ptr<Node>, uint64_t> delay;
-  map<Ptr<Node>, uint64_t> txDelay;
-  map<Ptr<Node>, uint64_t> bw;
+  vector<Ptr<Node>> q;                         // 等待寻找邻居的节点列表
+  map<Ptr<Node>, int> dis;                     // 从目的GPU到某节点的链路条数
+  map<Ptr<Node>, uint64_t> delay;              // 从目的GPU到某节点的累计传播延迟
+  map<Ptr<Node>, uint64_t> txDelay;            // 从目的GPU到某节点的累计序列化时间
+  map<Ptr<Node>, uint64_t> bw;                 // 整条路径的瓶颈带宽
   q.push_back(host);
   dis[host] = 0;
   delay[host] = 0;
@@ -268,7 +268,9 @@ void CalculateRoute(Ptr<Node> host) {
         }
           
       }
-      bool via_nvswitch = false;
+
+      // 生成候选下一跳表
+      bool via_nvswitch = false;                          // 检查当前节点的下一跳是否为NVSwitch节点
       if (d + 1 == dis[next]) {
         for(auto x : nextHop[next][host]) {
           if(x->GetNodeType() == 2) via_nvswitch = true;
@@ -313,16 +315,16 @@ void SetRoutingEntries() {
     auto &table = i->second;
     for (auto j = table.begin(); j != table.end(); j++) {
       Ptr<Node> dst = j->first;
-      Ipv4Address dstAddr = dst->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
-      vector<Ptr<Node>> nexts = j->second;
+      Ipv4Address dstAddr = dst->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();  // 获取目的GPU的IP地址
+      vector<Ptr<Node>> nexts = j->second;        // 到达目的GPU的候选下一跳节点列表
       for (int k = 0; k < (int)nexts.size(); k++) {
-        Ptr<Node> next = nexts[k];
-        uint32_t interface = nbr2if[node][next].idx;
+        Ptr<Node> next = nexts[k];                            // 获取候选下一跳节点
+        uint32_t interface = nbr2if[node][next].idx;          // 对应该下一跳的本地出口端口
         if (node->GetNodeType() == 1) {
-          DynamicCast<SwitchNode>(node)->AddTableEntry(dstAddr, interface);
+          DynamicCast<SwitchNode>(node)->AddTableEntry(dstAddr, interface);    // 给普通交换机安装一个转发表项
         } else if(node->GetNodeType() == 2){
-					DynamicCast<NVSwitchNode>(node)->AddTableEntry(dstAddr, interface);
-          node->GetObject<RdmaDriver>()->m_rdma->AddTableEntry(dstAddr, interface, true);
+					DynamicCast<NVSwitchNode>(node)->AddTableEntry(dstAddr, interface);  // 给NVSwitch安装一个转发表项
+          node->GetObject<RdmaDriver>()->m_rdma->AddTableEntry(dstAddr, interface, true);  // 给NVSwitch的RDMA模块安装一个转发表项
 				} else {
           bool is_nvswitch = false;
 					if(next->GetNodeType() == 2){ 
@@ -330,7 +332,7 @@ void SetRoutingEntries() {
 					}
 					node->GetObject<RdmaDriver>()->m_rdma->AddTableEntry(dstAddr, interface, is_nvswitch);
           if(next->GetId() == dst->GetId())  {
-            node->GetObject<RdmaDriver>()->m_rdma->add_nvswitch(dst->GetId());
+            node->GetObject<RdmaDriver>()->m_rdma->add_nvswitch(dst->GetId());   // 记录不经过中间节点，直接到达的目的节点编号
           }
         }
       }
@@ -755,6 +757,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
 
   NS_LOG_INFO("Create channels.");
 
+  // 创建一个通用的错误模型，所有链路都可以使用它
   Ptr<RateErrorModel> rem = CreateObject<RateErrorModel>();
   Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
   rem->SetRandomVariable(uv);
@@ -897,35 +900,35 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
   FILE *send_output = fopen(send_output_file.c_str(), "w");
   for (uint32_t i = 0; i < node_num; i++) {
     if (n.Get(i)->GetNodeType() == 0 || n.Get(i)->GetNodeType() == 2) { 
-      Ptr<RdmaHw> rdmaHw = CreateObject<RdmaHw>();
-      rdmaHw->SetAttribute("ClampTargetRate", BooleanValue(clamp_target_rate));
+      Ptr<RdmaHw> rdmaHw = CreateObject<RdmaHw>();            // 节点上的RDMA硬件对象
+      rdmaHw->SetAttribute("ClampTargetRate", BooleanValue(clamp_target_rate));       // 决定是否将目标速率压低
       rdmaHw->SetAttribute("AlphaResumInterval",
-                           DoubleValue(alpha_resume_interval));
-      rdmaHw->SetAttribute("RPTimer", DoubleValue(rp_timer));
+                           DoubleValue(alpha_resume_interval));                       // 检查是否收到CNP（接收端反馈）的时间间隔
+      rdmaHw->SetAttribute("RPTimer", DoubleValue(rp_timer));                         // 发送端尝试恢复速率的时间间隔（更新alpha）
       rdmaHw->SetAttribute("FastRecoveryTimes",
-                           UintegerValue(fast_recovery_times));
-      rdmaHw->SetAttribute("EwmaGain", DoubleValue(ewma_gain));
-      rdmaHw->SetAttribute("RateAI", DataRateValue(DataRate(rate_ai)));
-      rdmaHw->SetAttribute("RateHAI", DataRateValue(DataRate(rate_hai)));
-      rdmaHw->SetAttribute("L2BackToZero", BooleanValue(l2_back_to_zero));
-      rdmaHw->SetAttribute("L2ChunkSize", UintegerValue(l2_chunk_size));
-      rdmaHw->SetAttribute("L2AckInterval", UintegerValue(l2_ack_interval));
-      rdmaHw->SetAttribute("CcMode", UintegerValue(cc_mode));
+                           UintegerValue(fast_recovery_times));                       // 发送端尝试恢复速率的次数
+      rdmaHw->SetAttribute("EwmaGain", DoubleValue(ewma_gain));                       // 每次更新时，新拥塞反馈占多大权重
+      rdmaHw->SetAttribute("RateAI", DataRateValue(DataRate(rate_ai)));               // 主动增长阶段发送端速率增加的幅度
+      rdmaHw->SetAttribute("RateHAI", DataRateValue(DataRate(rate_hai)));             // 高速增长阶段发送端速率增加的幅度
+      rdmaHw->SetAttribute("L2BackToZero", BooleanValue(l2_back_to_zero));            // 发生确认或丢包时，是否退回当前数据块的起点
+      rdmaHw->SetAttribute("L2ChunkSize", UintegerValue(l2_chunk_size));              // 把一条RDMA数据流划分成多大的确认块
+      rdmaHw->SetAttribute("L2AckInterval", UintegerValue(l2_ack_interval));          // 接收多少字节后返回一次ACK
+      rdmaHw->SetAttribute("CcMode", UintegerValue(cc_mode));                         // 拥塞控制算法编号
       rdmaHw->SetAttribute("RateDecreaseInterval",
-                           DoubleValue(rate_decrease_interval));
-      rdmaHw->SetAttribute("MinRate", DataRateValue(DataRate(min_rate)));
-      rdmaHw->SetAttribute("Mtu", UintegerValue(packet_payload_size));
-      rdmaHw->SetAttribute("MiThresh", UintegerValue(mi_thresh));
-      rdmaHw->SetAttribute("VarWin", BooleanValue(var_win));
-      rdmaHw->SetAttribute("FastReact", BooleanValue(fast_react));
-      rdmaHw->SetAttribute("MultiRate", BooleanValue(multi_rate));
-      rdmaHw->SetAttribute("SampleFeedback", BooleanValue(sample_feedback));
-      rdmaHw->SetAttribute("TargetUtil", DoubleValue(u_target));
-      rdmaHw->SetAttribute("RateBound", BooleanValue(rate_bound));
+                           DoubleValue(rate_decrease_interval));                      // 发送端尝试降低速率的时间间隔
+      rdmaHw->SetAttribute("MinRate", DataRateValue(DataRate(min_rate)));             // 发送端速率的下限
+      rdmaHw->SetAttribute("Mtu", UintegerValue(packet_payload_size));                // 每次最多从一条RDMA数据中取出多少有效载荷组成数据包
+      rdmaHw->SetAttribute("MiThresh", UintegerValue(mi_thresh));                     // 连续多次（这个次数就是MiThresh）进行小幅加速后，改用基于网络利用率的较大调整
+      rdmaHw->SetAttribute("VarWin", BooleanValue(var_win));                          // 是否使用可变窗口
+      rdmaHw->SetAttribute("FastReact", BooleanValue(fast_react));                    // 是否在完整一轮反馈到齐前就利用新反馈调整速率
+      rdmaHw->SetAttribute("MultiRate", BooleanValue(multi_rate));                    // 是否为一条路径上的每一跳分别维护速率状态
+      rdmaHw->SetAttribute("SampleFeedback", BooleanValue(sample_feedback));          // 快速反应时是否只选取有明显排队的交换机反馈
+      rdmaHw->SetAttribute("TargetUtil", DoubleValue(u_target));                      // 希望瓶颈链路稳定运行在多高的利用率
+      rdmaHw->SetAttribute("RateBound", BooleanValue(rate_bound));                    // 计算出的发送速率是否真的用于限制发包间隔
       rdmaHw->SetAttribute("DctcpRateAI",
-                           DataRateValue(DataRate(dctcp_rate_ai)));
-      rdmaHw->SetAttribute("GPUsPerServer", UintegerValue(gpus_per_server));
-      rdmaHw->SetPintSmplThresh(pint_prob);
+                           DataRateValue(DataRate(dctcp_rate_ai)));                   // 使用 DCTCP 拥塞控制时，在网络没有拥塞的情况下，每完成一轮反馈，发送速率增加幅度
+      rdmaHw->SetAttribute("GPUsPerServer", UintegerValue(gpus_per_server));          // 每台服务器上有多少个GPU
+      rdmaHw->SetPintSmplThresh(pint_prob);                                           // PINT（把网络拥塞状态压缩后放进数据包）采样概率
       rdmaHw->SetAttribute("TotalPauseTimes",
                            UintegerValue(nic_total_pause_time));
       Ptr<RdmaDriver> rdma = CreateObject<RdmaDriver>();
@@ -947,10 +950,10 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
   else
     RdmaEgressQueue::ack_q_idx = 3;
 
-  CalculateRoutes(n);
-  SetRoutingEntries();
+  CalculateRoutes(n);                           // 以每个GPU网络端点为目的地，计算拓扑中其他节点应该经过哪个下一跳才能到达它
+  SetRoutingEntries();                          // 配置转发表
 
-  maxRtt = maxBdp = 0;
+  maxRtt = maxBdp = 0;                          // rtt和bdp（网络中的数据量）
   for (uint32_t i = 0; i < node_num; i++) {
     if (n.Get(i)->GetNodeType() != 0)
       continue;
@@ -959,7 +962,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
         continue;
       uint64_t delay = pairDelay[n.Get(i)][n.Get(j)];
       uint64_t txDelay = pairTxDelay[n.Get(i)][n.Get(j)];
-      uint64_t rtt = delay * 2 + txDelay;
+      uint64_t rtt = delay * 2 + txDelay;   // 无拥塞情况下的理想rtt
       uint64_t bw = pairBw[i][j];
       uint64_t bdp = rtt * bw / 1000000000 / 8;
       pairBdp[n.Get(i)][n.Get(j)] = bdp;
@@ -987,7 +990,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     if (nid >= n.GetN()) {
       continue;
     }
-    trace_nodes = NodeContainer(trace_nodes, n.Get(nid));
+    trace_nodes = NodeContainer(trace_nodes, n.Get(nid));   // 保存多个节点指针的容器
   }
 
   FILE *trace_output = fopen(trace_output_file.c_str(), "w");
@@ -995,11 +998,11 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     qbb.EnableTracing(trace_output, trace_nodes);
 
   {
-    SimSetting sim_setting;
+    SimSetting sim_setting;                // 用于保存某个节点的某个端口速度和全局最大bdp
     for (auto i : nbr2if) {
       for (auto j : i.second) {
         uint16_t node = i.first->GetId();
-        uint8_t intf = j.second.idx;
+        uint8_t intf = j.second.idx;       // 当前节点到邻居节点的端口号
         uint64_t bps =
             DynamicCast<QbbNetDevice>(i.first->GetDevice(j.second.idx))
                 ->GetDataRate()
@@ -1018,7 +1021,7 @@ void SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>),void (*send_fini
     if (n.Get(i)->GetNodeType() == 0 || n.Get(i)->GetNodeType() == 2)
       for (uint32_t j = 0; j < node_num; j++) {
         if (n.Get(j)->GetNodeType() == 0 || n.Get(j)->GetNodeType() == 2)
-          portNumber[i][j] = 10000; 
+          portNumber[i][j] = 10000;     // 创建QP时的源端口号
       }
   }
   flow_input.idx = -1;

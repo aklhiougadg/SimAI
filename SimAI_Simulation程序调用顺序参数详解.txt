@@ -1,0 +1,862 @@
+SimAI Simulation 程序调用顺序参数详解
+================================================
+
+
+一、main()：启动网络模拟
+========================
+
+1. thread
+含义：运行 NS-3 多线程事件模拟器时允许使用的真实 CPU 线程数。
+作用：影响模拟程序在电脑上的运行速度，不直接改变被模拟网络的带宽、传播延迟和通信耗时。
+
+2. workload
+含义：描述训练计算、通信类型、通信量和执行顺序的工作负载文件。
+作用：产生 GPU 之间的通信需求，决定网络何时出现哪种集合通信流量。
+
+3. network_topo
+含义：描述 GPU、NVSwitch、普通交换机及其物理链路的拓扑文件。
+作用：为 SetupNetwork() 提供节点数量、节点类型、链路端点、带宽、传播延迟和误包率。
+
+4. network_conf
+含义：描述网络设备行为和网络算法设置的配置文件。
+作用：为 ReadConf() 提供 PFC、ECN、RDMA 拥塞控制、交换机缓存和链路错误等参数。
+
+
+二、ReadConf()：读取网络配置参数
+================================
+
+1. ENABLE_QCN
+含义：QCN/ECN 相关网络拥塞反馈功能的启用开关。
+作用：控制普通交换机是否允许设置 ECN 拥塞标记，并把相应启用状态传给 QbbNetDevice。
+
+2. USE_DYNAMIC_PFC_THRESHOLD
+含义：是否启用动态 PFC 阈值的配置开关。
+作用：把动态阈值选择写入 QbbNetDevice；当前代码中该成员的后续有效使用不明显。
+
+3. CLAMP_TARGET_RATE
+含义：收到拥塞反馈时是否立即限制目标发送速率的开关。
+作用：影响 RDMA 发送端在拥塞发生后的降速方式和后续数据包发送间隔。
+
+4. PAUSE_TIME
+含义：PFC pause 报文中携带的暂停时间值。
+作用：通知上游端口暂停指定优先级队列；当前接收逻辑主要用它是否大于零区分 pause 与 resume。
+
+5. DATA_RATE
+含义：网络配置文件提供的全局链路速率字符串。
+作用：当前链路创建循环使用拓扑文件中的同名局部 data_rate，因此这个全局配置值实际没有决定 QbbNetDevice 带宽。
+
+6. LINK_DELAY
+含义：网络配置文件提供的全局链路传播延迟字符串。
+作用：当前链路创建循环使用拓扑文件中的同名局部 link_delay，因此这个全局配置值实际没有决定 QbbChannel 延迟。
+
+7. PACKET_PAYLOAD_SIZE
+含义：一个网络数据包能够携带的有效通信数据大小。
+作用：决定大块 GPU 通信数据要拆成多少个包，并影响单包序列化时间和网络事件数量。
+
+8. L2_CHUNK_SIZE
+含义：二层可靠传输组织确认和恢复状态时使用的数据块大小。
+作用：决定可靠传输按多大范围管理序号、确认和恢复；它不是实际网络包的有效载荷大小。
+
+9. L2_ACK_INTERVAL
+含义：二层可靠传输产生确认信息的间隔。
+作用：影响发送端得知接收进度的速度以及反向确认包的数量。
+
+10. L2_BACK_TO_ZERO
+含义：可靠传输恢复时是否回到当前数据块起点处理发送序号的开关。
+作用：影响发生丢包或恢复事件后需要重新发送和重新确认的数据范围。
+
+11. FLOW_FILE
+含义：底层网络程序预留的静态流输入文件。
+作用：当前 GPU 集合通信主路线只读取其中的流数量但没有继续使用，实际通信流量主要由 workload 产生。
+
+12. ALPHA_RESUME_INTERVAL
+含义：DCQCN 更新和恢复拥塞程度估计值 alpha 的时间间隔。
+作用：影响发送端多快减弱旧拥塞反馈的影响并进入速率恢复过程。
+
+13. RP_TIMER
+含义：DCQCN 发送端进行速率恢复的定时参数。
+作用：决定发送端降速后何时执行下一次恢复速率的处理。
+
+14. EWMA_GAIN
+含义：计算拥塞程度指数加权平均时，新反馈所占的权重。
+作用：决定发送端对新拥塞反馈的敏感程度和速率变化的平滑程度。
+
+15. FAST_RECOVERY_TIMES
+含义：DCQCN 快速恢复阶段允许执行的次数阈值。
+作用：决定发送速率在切换到其他恢复阶段前能够进行多少次快速恢复。
+
+16. RATE_AI
+含义：普通加性增速阶段每次增加的发送速率。
+作用：决定拥塞缓解后 RDMA 发送速率恢复的基本步长。
+
+17. RATE_HAI
+含义：更积极的加性增速阶段每次增加的发送速率。
+作用：让 RDMA 发送端在满足条件时以比 RATE_AI 更大的步长恢复带宽。
+
+18. ERROR_RATE_PER_LINK
+含义：没有为某条链路指定专属正误包率时使用的全局按包错误概率。
+作用：控制 QbbNetDevice 接收数据包时随机判定包损坏并丢弃的概率。
+
+19. CC_MODE
+含义：选择 RDMA 拥塞控制算法和数据包网络状态格式的模式编号。
+作用：决定使用 DCQCN、HPCC、TIMELY、DCTCP 或 HPCC-PINT 等行为，并影响交换机和发送端如何生成、携带和处理拥塞反馈。
+
+20. RATE_DECREASE_INTERVAL
+含义：检查或执行降低 RDMA 发送速率的时间间隔。
+作用：限制发送端根据拥塞反馈进行连续降速的频率。
+
+21. MIN_RATE
+含义：一条 RDMA QP 被拥塞控制限速时允许达到的最低发送速率。
+作用：防止拥塞控制把一条流的发送速率无限降低。
+
+22. HAS_WIN
+含义：是否为 RDMA QP 启用在途数据窗口限制的开关。
+作用：控制一条 QP 最多允许多少数据处于已发送但尚未确认状态。
+
+23. GLOBAL_T
+含义：选择所有 QP 共用全局最大 BDP/RTT，还是使用源目节点对专属 BDP/RTT 的开关。
+作用：影响 RDMA QP 的初始窗口和基础往返时间；当前代码会把读取结果强制改为 1，因此固定使用全局最大值。
+
+24. MI_THRESH
+含义：速率恢复过程中切换到更积极增速阶段的次数阈值。
+作用：决定发送端经过多少次普通增长后改变恢复速率的方式。
+
+25. VAR_WIN
+含义：在途数据窗口是否随发送速率和网络状态变化的开关。
+作用：启用后允许 RDMA 根据当前速率调整窗口，而不是始终使用固定窗口。
+
+26. FAST_REACT
+含义：是否对新到达的拥塞反馈进行快速响应的开关。
+作用：减少等待完整控制周期带来的降速滞后。
+
+27. U_TARGET
+含义：HPCC 等算法希望瓶颈链路维持的目标利用率。
+作用：作为计算目标发送速率的利用率基准，为突发流量和反馈延迟预留带宽余量。
+
+28. INT_MULTI
+含义：完整逐跳 INT 信息中累计字节数和队列长度的编码缩放系数。
+作用：在可表示范围和数值精度之间进行权衡。
+
+29. RATE_BOUND
+含义：拥塞控制计算出的速率是否真正限制数据包发送时间的开关。
+作用：启用后，QP 速率降低会直接增大连续数据包之间的发送间隔。
+
+30. ACK_HIGH_PRIO
+含义：ACK 和 NACK 是否使用高优先级发送队列的开关。
+作用：影响确认与反馈报文的排队时间，从而影响发送窗口推进和拥塞反馈返回速度。
+
+31. DCTCP_RATE_AI
+含义：DCTCP 模式中恢复发送速率时使用的加性增长步长。
+作用：决定 CC_MODE=8 时发送端从降速状态恢复带宽的速度。
+
+32. NIC_TOTAL_PAUSE_TIME
+含义：网卡侧额外暂停行为使用的次数或总量参数。
+作用：当前只保存到 RdmaHw::m_total_pause_times，没有运行代码读取，因此这个版本中即使设为非零也不会改变网络行为。
+
+33. LINK_DOWN
+含义：由链路故障时间、端点 A 和端点 B 组成的链路失效配置。
+作用：在指定模拟时间断开 A 与 B 的直连链路，用于研究故障对路由和通信完成时间的影响。
+
+34. KMAX_MAP
+含义：不同链路速率对应的 ECN 高队列阈值表。
+作用：让普通交换机端口按照自身带宽选择进入高拥塞标记区域的阈值。
+
+35. KMIN_MAP
+含义：不同链路速率对应的 ECN 低队列阈值表。
+作用：让普通交换机端口按照自身带宽选择开始概率性 ECN 标记的队列长度。
+
+36. PMAX_MAP
+含义：不同链路速率对应的最大 ECN 标记概率表。
+作用：与 KMIN、KMAX 一起决定交换机在不同队列长度下标记拥塞的概率。
+
+37. BUFFER_SIZE
+含义：普通交换机和 NVSwitch 可使用的总缓存容量。
+作用：影响数据包缓存准入、排队空间、PFC 阈值和缓存不足时的丢包。
+
+38. MULTI_RATE
+含义：HPCC 是否为路径中的不同跳分别维护速率状态的开关。
+作用：决定 HPCC 是按各跳拥塞情况分别控制，还是使用统一的路径速率状态。
+
+39. SAMPLE_FEEDBACK
+含义：HPCC 快速反应时是否只选取存在明显排队跳信息的开关。
+作用：启用后快速反应会忽略没有排队的交换机跳，集中使用更能表示瓶颈的逐跳反馈；它不控制 PINT 的随机 ACK 采样。
+
+40. PINT_LOG_BASE
+含义：PINT 压缩网络状态时使用的对数编码底数。
+作用：决定压缩状态的可表示范围、数值精度和所需包头空间。
+
+41. PINT_PROB
+含义：HPCC-PINT 发送端处理 ACK 拥塞反馈的采样概率。
+作用：决定 CC_MODE=10 时有多少 ACK 会触发 PINT 速率更新；1.0 表示全部相关 ACK 都参与。
+
+42. TRACE_FILE
+含义：保存待启用逐包网络追踪的节点编号列表的输入文件路径。
+作用：让 SetupNetwork() 选出需要连接追踪回调的 GPU、NVSwitch 或普通交换机节点。
+
+43. TRACE_OUTPUT_FILE
+含义：逐包网络事件追踪文件的输出路径。
+作用：决定 SimSetting 文件头和运行阶段数据包事件写入哪个文件。
+
+44. SIMULATOR_STOP_TIME
+含义：配置文件中提供的模拟停止时间参数。
+作用：当前版本只把它读入 simulator_stop_time，但没有用该变量安排 Simulator::Stop()，因此修改它不会改变模拟结束时间。
+
+45. FCT_OUTPUT_FILE
+含义：QP 流完成时间记录文件的输出路径。
+作用：SetupNetwork() 用它打开 fct_output，QP 全部确认完成后由 qp_finish() 写入实际 FCT 和无竞争基线。
+
+46. PFC_OUTPUT_FILE
+含义：PFC 暂停与恢复事件记录文件的输出路径。
+作用：链路端口触发 QbbPfc 追踪事件时，由 get_pfc() 把时间、节点、端口和 pause/resume 类型写入该文件。
+
+47. ENABLE_TRACE
+含义：是否给 TRACE_FILE 指定节点启用逐包追踪的开关。
+作用：非零时调用 EnableTracing() 安装逐包事件回调；为零时不安装这些回调。
+
+48. QLEN_MON_FILE
+含义：交换机和 NVSwitch 队列长度周期监控文件的输出路径。
+作用：保存各采样时刻的交换节点编号、端口、优先级队列长度和端口总排队长度。
+
+49. BW_MON_FILE
+含义：GPU、NVSwitch 和普通交换机端口带宽监控文件的输出路径。
+作用：保存每个采样间隔内各节点端口的发送带宽或利用情况。
+
+50. RATE_MON_FILE
+含义：RDMA QP 当前发送速率监控文件的输出路径。
+作用：周期记录每条活动 QP 的源、目的、端口、数据量和当前拥塞控制速率。
+
+51. CNP_MON_FILE
+含义：RDMA QP 收到的 CNP 拥塞通知数量监控文件的输出路径。
+作用：周期记录各 QP 在采样期间收到的 CNP 数量，用来和队列增长及速率下降对齐分析。
+
+52. MON_START
+含义：队列、带宽、QP 速率和 CNP 周期监控第一次执行的模拟时间，单位为微秒。
+作用：决定 schedule_monitor() 把四类监控的首个事件安排在什么时候。
+
+53. MON_END
+含义：配置中声明的监控结束时间。
+作用：当前版本虽然读取该值，但四个监控函数没有检查它并会持续自我调度，因此该参数目前不会停止监控。
+
+54. QP_MON_INTERVAL
+含义：QP 发送速率和 CNP 数量的采样间隔，单位为微秒。
+作用：决定 monitor_qp_rate() 和 monitor_qp_cnp_number() 两次执行之间的模拟时间。
+
+55. BW_MON_INTERVAL
+含义：节点端口带宽的采样间隔，单位为微秒。
+作用：决定 monitor_bw() 的调度周期，并作为把相邻两次累计字节差换算成带宽的时间窗口。
+
+56. QLEN_MON_INTERVAL
+含义：交换机队列长度的采样间隔，单位为微秒。
+作用：决定 monitor_qlen() 周期读取普通交换机和 NVSwitch 各端口队列状态的频率。
+
+
+三、SetConfig()：写入网络对象默认参数
+=====================================
+
+1. QbbNetDevice::PauseTime
+含义：QbbNetDevice 保存的 PFC 暂停时间属性。
+作用：让后续创建的端口使用 PAUSE_TIME 生成 PFC pause 报文。
+
+2. QbbNetDevice::QcnEnabled
+含义：QbbNetDevice 保存的 QCN 相关启用属性。
+作用：让后续创建的所有 QbbNetDevice 继承 ENABLE_QCN 的设置。
+
+3. QbbNetDevice::DynamicThreshold
+含义：QbbNetDevice 保存的动态 PFC 阈值启用属性。
+作用：把 USE_DYNAMIC_PFC_THRESHOLD 的选择传递给后续创建的端口。
+
+4. IntHop::multi
+含义：INT 逐跳状态中数值字段使用的统一缩放系数。
+作用：控制字节计数和队列长度写入有限包头字段时的范围和精度。
+
+5. IntHeader::mode
+含义：数据包 INT 头使用的网络状态记录格式。
+作用：根据 CC_MODE 选择时间戳、完整逐跳状态、PINT 压缩状态或不记录这些状态。
+
+6. IntHeader::pint_bytes
+含义：PINT 压缩网络状态在数据包头中占用的字节数。
+作用：决定 CC_MODE=10 时每个数据包为压缩拥塞信息增加多少包头开销。
+
+
+四、SetupNetwork()：创建节点和物理链路
+=====================================
+
+1. topology_file
+含义：SetupNetwork() 实际打开的物理拓扑文件路径。
+作用：提供节点组成、节点类型列表和全部物理链路记录。
+
+2. flow_file
+含义：SetupNetwork() 实际打开的静态网络流文件路径。
+作用：提供 flow_num；当前 GPU workload 主路线没有继续用它创建流量。
+
+3. trace_file
+含义：指定需要启用网络跟踪的节点列表文件。
+作用：提供后续要连接数据包跟踪回调的节点数量和节点编号。
+
+4. node_num
+含义：拓扑中的 NS-3 节点总数，包含 GPU、NVSwitch 和普通交换机。
+作用：决定节点容器大小和创建节点的循环次数。
+
+5. gpus_per_server
+含义：每台服务器包含的 GPU 数量。
+作用：用于把 GPU 划分到不同服务器和 NVSwitch，并让上层集合通信与底层网络采用相同服务器边界。
+
+6. nvswitch_num
+含义：拓扑中的 NVSwitch 节点数量。
+作用：决定读取多少个 NVSwitch 编号，并参与计算真正的 GPU 数量。
+
+7. switch_num
+含义：拓扑中的普通数据中心交换机数量。
+作用：决定读取多少个普通交换机编号，并从节点总数中区分非计算节点。
+
+8. link_num
+含义：拓扑文件中物理链路记录的数量。
+作用：决定链路创建循环执行多少次。
+
+9. gpu_type_str
+含义：拓扑文件中以字符串表示的 GPU 型号。
+作用：作为输入转换成程序内部的 gpu_type。
+
+10. gpu_type
+含义：程序内部保存的 GPU 型号枚举。
+作用：传给上层 Sys 和硬件相关通信模型；无法识别的型号会变成 GPUType::NONE。
+
+11. node_type
+含义：创建节点前使用的临时节点类别表，0 表示 GPU，1 表示普通交换机，2 表示 NVSwitch。
+作用：决定每个编号最终创建普通 Node、SwitchNode 还是 NVSwitchNode。
+
+12. sid
+含义：从拓扑文件节点类型列表中读出的当前节点编号。
+作用：把 node_type 中对应位置标记为普通交换机或 NVSwitch。
+
+13. m_node_type
+含义：节点创建后保存在节点对象内部的长期类别标记。
+作用：让收包、转发、路由和后续配置判断当前节点是 GPU、普通交换机还是 NVSwitch。
+
+14. SwitchNode::EcnEnabled
+含义：普通交换机是否允许执行 ECN 拥塞标记的属性。
+作用：控制交换机能否在队列拥塞时给数据包写入 ECN 标记。
+
+15. serverAddress
+含义：根据节点编号生成的 GPU/NVSwitch 稳定 IPv4 地址，形式为 11.x.x.1。
+作用：标识数据最终要到达的 GPU 或 NVSwitch 节点，并作为后续转发表的目标地址。
+
+16. error_rate_per_link
+含义：SetupNetwork() 创建通用误码模型时使用的全局按包错误概率。
+作用：为没有专属正误包率的物理链路提供默认丢包概率。
+
+17. RngSeed
+含义：NS-3 随机数系统的全局初始种子。
+作用：确定整个模拟中伪随机数序列的初始状态，使相同实验能够重现。
+
+18. RngRun
+含义：NS-3 随机数系统的重复运行编号。
+作用：在保持参数相同的情况下切换到另一组独立随机结果，用于重复实验。
+
+19. stream
+含义：分配给链路误码随机数生成器的随机数流编号，当前代码固定使用 50。
+作用：为误包判断选择一条可重现的确定性随机序列。
+
+20. src
+含义：拓扑链路记录中的第一个节点编号。
+作用：指定当前物理链路一端的节点，并确定 d.Get(0) 安装在哪个节点上。
+
+21. dst
+含义：拓扑链路记录中的第二个节点编号。
+作用：指定当前物理链路另一端的节点，并确定 d.Get(1) 安装在哪个节点上。
+
+22. data_rate
+含义：当前拓扑链路记录给出的端口发送速率。
+作用：设置链路两端 QbbNetDevice 的带宽，并决定数据包的序列化时间。
+
+23. link_delay
+含义：当前拓扑链路记录给出的固定传播延迟。
+作用：设置 QbbChannel 的 Delay，并形成端到端传播时间的一部分。
+
+24. error_rate
+含义：当前拓扑链路记录给出的专属按包错误概率。
+作用：大于零时覆盖全局 ERROR_RATE_PER_LINK，为当前链路单独设置随机丢包概率。
+
+25. QbbNetDevice::DataRate
+含义：链路一端模拟网卡或交换机端口的发送带宽。
+作用：决定端口把一个数据包的全部 bit 推入 QbbChannel 所需的时间。
+
+26. QbbChannel::Delay
+含义：数据包从物理信道一端传播到另一端的固定时间。
+作用：为每一跳增加传播延迟，不包含队列等待和端口序列化时间。
+
+27. QbbNetDevice::ReceiveErrorModel
+含义：QbbNetDevice 接收数据包时使用的误码判断模型。
+作用：在数据包进入后续协议或转发逻辑前决定是否将其作为损坏包丢弃。
+
+28. QbbNetDevice::IfIndex
+含义：QbbNetDevice 在所属 Node 设备列表中的本地端口编号。
+作用：让路由表和邻居映射能够指定数据包实际从哪个物理端口发送。
+
+29. IPv4 接口编号 1
+含义：代码为 GPU/NVSwitch 稳定地址固定选择的第一个真实 IPv4 接口编号。
+作用：把 serverAddress 绑定到第一个真实 QbbNetDevice 对应的 IPv4 接口。
+
+30. serverAddress 的子网掩码
+含义：稳定节点地址使用的 255.0.0.0，即 /8 掩码。
+作用：把所有 11.x.x.1 节点地址放入同一个 11.0.0.0/8 地址范围。
+
+31. nbr2if.idx
+含义：当前节点到某个直接邻居时应使用的本地 QbbNetDevice 编号。
+作用：后续路径计算得到下一跳后，用它找到实际输出端口。
+
+32. nbr2if.up
+含义：当前节点到直接邻居的链路方向是否可用。
+作用：决定路径计算能否经过这条链路；链路故障时会被设为 false。
+
+33. nbr2if.delay
+含义：当前节点到直接邻居的 QbbChannel 传播延迟。
+作用：在路径计算中逐跳累加，得到端到端基础传播延迟。
+
+34. nbr2if.bw
+含义：当前节点到直接邻居的 QbbNetDevice 带宽。
+作用：计算每跳数据包序列化时间和整条路径的瓶颈带宽。
+
+35. 10.A.B.0/24
+含义：根据链路序号为每条点到点物理链路生成的独立接口子网。
+作用：给当前链路两端的具体 IPv4 接口分配 .1 和 .2 地址，并把接口设置为启用。
+
+
+五、main()：物理网络建立后的网络参数
+====================================
+
+1. nodes_num
+含义：node_num 减去普通交换机数量后得到的逻辑执行单元数量，包含 GPU 和 NVSwitch。
+作用：决定创建多少个 ASTRASimNetwork 和 AstraSim::Sys。
+
+2. gpu_num
+含义：node_num 同时减去普通交换机和 NVSwitch 后得到的真实 GPU 数量。
+作用：用于 GPU 分组、NVSwitch 映射和设置每个 Sys 看到的 GPU 总数。
+
+3. node2nvswitch
+含义：GPU/NVSwitch 逻辑编号到所属 NVSwitch 编号的映射。
+作用：让每个 Sys 知道服务器内部通信应对应哪个 NVSwitch。
+
+4. NVswitchs
+含义：保存全部 NVSwitch 具体编号的数组。
+作用：向每个 Sys 提供可用于服务器内部通信的 NVSwitch 节点列表。
+
+5. rank
+含义：当前 ASTRASimNetwork 对应的逻辑网络节点编号。
+作用：把 AstraSim 上层发送和接收请求与相同编号的底层网络节点关联起来。
+
+6. npu_offset
+含义：逻辑 NPU/GPU 编号使用的额外偏移量。
+作用：调整上层逻辑编号与全局生成器数组之间的对应关系；当前调用固定为 0。
+
+7. physical_dims
+含义：上层集合通信生成器看到的逻辑通信维度大小，当前为只包含 nodes_num 的单元素向量。
+作用：把全部逻辑执行单元组织成一个通信维度，供集合通信算法划分参与者。
+
+8. queues_per_dim
+含义：每个逻辑通信维度配置的上层通信队列数量。
+作用：决定集合通信任务如何进入各维度队列；它不等于 QbbNetDevice 的 PFC 优先级队列数量。
+
+9. comm_scale
+含义：上层通信相关时间或通信量使用的缩放因子。
+作用：统一放大或缩小上层通信模型；当前传入 1 时不额外缩放。
+
+10. injection_scale
+含义：通信请求注入相关时间使用的缩放因子。
+作用：调整 Sys 向网络注入通信请求时使用的内部通信延迟；当前传入 1 时不额外缩放。
+
+11. all_gpus
+含义：传给 Sys 的 GPU 规模向量，当前调用实际传入只包含 gpu_num 的单元素向量。
+作用：为上层集合通信生成逻辑提供 GPU 规模；它当前不是逐一列出所有 GPU 编号的数组。
+
+12. nvswitch_id
+含义：当前 Sys 所属或对应的 NVSwitch 编号。
+作用：确定该逻辑执行单元进行服务器内部通信时使用哪个 NVSwitch。
+
+13. num_gpus
+含义：当前模拟中真正参与训练和通信的 GPU 总数。
+作用：让每个 Sys 使用不包含普通交换机和 NVSwitch 的 GPU 规模。
+
+
+六、SetupNetwork()：配置交换机端口和缓存
+=========================================
+
+1. nic_rate
+含义：从第一个 GPU 节点的设备 1 读取的网卡带宽基准。
+作用：用于比较交换机端口相对 GPU 网卡快多少，并据此调整动态 PFC 阈值中的共享缓存比例；它不会修改任何端口的实际带宽。
+
+2. sw
+含义：当前正在配置的 SwitchNode 或 NVSwitchNode 智能指针。
+作用：提供当前交换机的端口列表、节点编号和 SwitchMmu，使程序能够按端口写入网络运行参数。
+
+3. dev
+含义：当前交换机上编号为 j 的 QbbNetDevice 端口。
+作用：提供该端口的带宽和所连接 QbbChannel 的传播延迟，并作为 ECN、PFC 和 headroom 配置的端口对象。
+
+4. rate
+含义：当前交换机端口的每秒比特发送速率。
+作用：用于查找与该链路速度匹配的 ECN 阈值，并与 nic_rate 比较以设置动态 PFC 阈值。
+
+5. rate2kmin[rate]
+含义：当前端口速率对应的 ECN 低队列阈值。
+作用：写入 SwitchMmu 的 kmin；运行时出口队列超过它后开始按概率设置 ECN 标记。
+
+6. rate2kmax[rate]
+含义：当前端口速率对应的 ECN 高队列阈值。
+作用：写入 SwitchMmu 的 kmax；运行时出口队列超过它后确定对数据包设置 ECN 标记。
+
+7. rate2pmax[rate]
+含义：当前端口速率对应的最大 ECN 标记概率。
+作用：与 kmin、kmax 一起决定出口队列处于两个阈值之间时的实际 ECN 标记概率。
+
+8. delay
+含义：当前交换机端口连接的 QbbChannel 传播延迟，使用 NS-3 时间步保存。
+作用：与端口带宽共同估计 PFC 生效前仍可能到达的在途字节数。
+
+9. headroom
+含义：为 PFC 暂停生效前仍会到达的数据预留的每端口缓存字节数。
+作用：当前按 rate×delay÷8÷10^9×3 计算并写入 SwitchMmu，防止上游停止前的在途数据立即导致缓存溢出。
+
+10. shift
+含义：配置每个交换机端口 pfc_a_shift 时使用的初始右移位数，当前初始值为 3。
+作用：提供动态 PFC 共享缓存比例的初值，并在端口速率高于 nic_rate 时逐步减小。
+
+11. pfc_a_shift[j]
+含义：当前端口计算动态 PFC 阈值时对剩余共享缓存执行的右移位数。
+作用：决定端口可使用的剩余共享缓存比例；数值越小，触发 PFC 前允许使用的共享缓存越多。
+
+12. sw->GetNDevices()-1
+含义：当前交换机设备总数扣除回环设备后得到的真实网络端口数。
+作用：传给 ConfigNPort()，用于累计所有真实端口的 headroom 和保留缓存。
+
+13. buffer_size * 1024 * 1024
+含义：把配置文件中的 MiB 形式交换机缓存容量转换成字节后的数值。
+作用：传给 ConfigBufferSize()，覆盖 SwitchMmu 构造时的默认总缓存大小。
+
+14. SwitchMmu::node_id
+含义：当前 SwitchMmu 所属交换机的 NS-3 节点编号。
+作用：让运行时缓存不足、丢包等日志能够指出事件发生在哪个交换机节点。
+
+
+七、SetupNetwork()：创建并配置 RDMA 端侧对象
+============================================
+
+1. ENABLE_QP
+含义：是否编译并执行 QP 和 RDMA 端侧初始化代码的预处理开关。
+作用：启用时为 GPU/NPU 端节点创建 RdmaHw、RdmaDriver、QP 接口管理和完成回调；禁用时整段代码不会进入编译结果。
+
+2. fct_output
+含义：由 fct_output_file 打开的流完成时间输出文件句柄。
+作用：预先绑定到 qp_finish 回调，在 QP 全部数据被确认后写入实际 FCT 和无竞争基线时间。
+
+3. send_output
+含义：由 send_output_file 打开的发送完成输出文件句柄。
+作用：预先绑定到 send_finish 回调，记录一条上层通信的数据何时全部离开发送端网卡。
+
+4. rdmaHw
+含义：为当前 GPU/NPU 端节点创建的 RdmaHw 智能指针。
+作用：保存 QP、网卡接口、路由、确认、速率和拥塞控制状态，并负责生成和处理 RDMA 数据包。
+
+5. DctcpRateAI
+含义：写入 RdmaHw 的 DCTCP 加性速率增长属性。
+作用：在 CC_MODE=8 且一批反馈没有处于拥塞降速状态时，决定当前 QP 每次恢复增加多少发送速率。
+
+6. m_dctcp_rai
+含义：RdmaHw 内部实际保存 DctcpRateAI 的 DataRate 成员。
+作用：参与 qp->m_rate + m_dctcp_rai 的运行时计算，并把结果限制在 QP 最大速率以内。
+
+7. GPUsPerServer
+含义：写入 RdmaHw 的每服务器 GPU 数量属性。
+作用：让 RdmaHw 根据源和目的 GPU 编号判断通信是否属于同一台服务器。
+
+8. m_gpus_per_server
+含义：RdmaHw 内部实际保存 GPUsPerServer 的整数成员。
+作用：在 GetNicIdxOfQp() 中通过 src/m_gpus_per_server 与 dst/m_gpus_per_server 的结果选择 NVSwitch 或普通网络端口。
+
+9. pint_smpl_thresh
+含义：由 PINT_PROB 乘以 65536 得到的 PINT ACK 随机采样门限。
+作用：CC_MODE=10 时把随机数与该门限比较，决定当前 ACK 是否用于 HPCC-PINT 速率更新。
+
+10. TotalPauseTimes
+含义：写入 RdmaHw 的 PCIe 侧额外暂停次数属性。
+作用：当前只把数值保存到 m_total_pause_times，没有运行逻辑读取，所以目前不会改变 PFC、发包或完成时间。
+
+11. m_total_pause_times
+含义：RdmaHw 内部保存 TotalPauseTimes 的整数成员。
+作用：作为尚未接入运行流程的预留状态存在，当前版本没有实际网络作用。
+
+12. node
+含义：从 NodeContainer n 中取出的当前 GPU/NPU 端节点智能指针。
+作用：交给 RdmaDriver 和 RdmaHw，使 RDMA 模块能够访问该节点已经创建的网卡、协议对象和节点编号。
+
+13. rdma
+含义：为当前端节点创建的 RdmaDriver 智能指针。
+作用：连接 Astra-Sim 上层通信接口与 RdmaHw，并向 Node 提供 AddQueuePair 和完成事件入口。
+
+14. RdmaDriver::m_node
+含义：RdmaDriver 内部保存的所属 Node 指针。
+作用：让 Init() 能遍历当前节点的全部 NetDevice，并为它们建立 RDMA 接口记录。
+
+15. RdmaDriver::m_rdma
+含义：RdmaDriver 内部保存的 RdmaHw 指针。
+作用：让驱动把创建 QP、启用 NVLS 和完成处理等操作转交给真正保存网络状态的 RdmaHw。
+
+
+八、RdmaDriver::Init() 与 RdmaHw::Setup()：组织网卡和 QP
+========================================================
+
+1. m_node->GetNDevices()
+含义：当前端节点已经安装的 NetDevice 总数，包含回环设备和真实 QbbNetDevice。
+作用：决定 RdmaHw::m_nic 创建多少项，使其索引与 Node 的设备编号保持一致。
+
+2. RdmaInterfaceMgr::dev
+含义：一项 RDMA 接口记录中保存的 QbbNetDevice 指针；非 Qbb 设备对应值为空。
+作用：指出该接口记录实际控制哪个端口，使后续 QP 能使用对应网卡发送。
+
+3. RdmaInterfaceMgr::qpGrp
+含义：一项 RDMA 接口记录中保存的 RdmaQueuePairGroup 指针。
+作用：集中保存分配给同一个端口的 QP，并与该端口的 RdmaEgressQueue 共享。
+
+4. RdmaHw::m_nic
+含义：当前 RdmaHw 保存的全部 RdmaInterfaceMgr 数组。
+作用：把 Node 的设备编号映射为 QbbNetDevice 和 QP 集合，供选网卡、发包、收反馈和重新分配 QP 使用。
+
+5. RdmaQueuePairGroup::m_qps
+含义：一个端口对应的全部 RdmaQueuePair 智能指针数组。
+作用：让 RdmaEgressQueue 在共用该端口的多条 RDMA 流之间选择当前满足窗口、速率和暂停条件的 QP。
+
+6. tx_bytes
+含义：RdmaHw 为每个接口保存的累计发送字节数数组。
+作用：记录端口已经发送的数据量，为主机端口带宽监控提供累计值。
+
+7. last_tx_bytes
+含义：RdmaHw 上一次带宽监控时保存的各端口累计发送字节数。
+作用：与当前 tx_bytes 做差，计算一个监控间隔内的实际发送量和利用率。
+
+8. m_rdmaReceiveCb
+含义：QbbNetDevice 收到 RDMA 相关数据包时调用的回调。
+作用：把到达端口的数据包交给 RdmaHw::Receive，继续区分数据、ACK、NACK、CNP 等报文。
+
+9. m_rdmaSentCb
+含义：QbbNetDevice 完成项目所识别的最后一个发送包时调用的回调。
+作用：把事件交给 RdmaHw::SendPacketComplete，并最终触发 SendComplete 发送完成通知。
+
+10. m_rdmaLinkDownCb
+含义：QbbNetDevice 检测到所属链路失效时调用的回调。
+作用：把故障事件通知 RdmaHw，为后续链路故障处理和 QP 重新分配提供入口。
+
+11. m_rdmaPktSent
+含义：QbbNetDevice 实际送出一个 RDMA 数据包后调用的回调。
+作用：通知 RdmaHw 更新该 QP 的发包状态和相关统计。
+
+12. m_rdmaUpdateTxBytes
+含义：QbbNetDevice 更新端口发送字节统计时调用的回调。
+作用：让 RdmaHw 同步维护 tx_bytes，为主机网卡带宽监控提供数据。
+
+13. m_rdmaGetNxtPkt
+含义：RdmaEgressQueue 向 RdmaHw 请求指定 QP 下一个数据包的回调。
+作用：让端口调度器选中 QP 后，由 RdmaHw 根据 MTU、序号、剩余数据和速率状态生成实际 Packet。
+
+14. m_qpCompleteCallback
+含义：RdmaHw 保存的 QP 全部确认完成回调。
+作用：QP 完成时把事件传给 RdmaDriver::QpComplete，再触发 QpComplete TraceSource 和上层完成通知。
+
+15. m_sendCompleteCallback
+含义：RdmaHw 保存的源端发送完成回调。
+作用：最后一部分数据完成源网卡序列化时把事件传给 RdmaDriver::SendComplete，再触发 SendComplete TraceSource。
+
+
+九、SetupNetwork()：通信完成事件参数
+====================================
+
+1. QpComplete
+含义：RdmaDriver 中表示一条 QP 的全部数据已经被确认完成的 TraceSource 名称。
+作用：触发绑定的 qp_finish(fct_output, q)，记录端到端流完成时间并通知 Astra-Sim 接收完成。
+
+2. SendComplete
+含义：RdmaDriver 中表示一条通信的数据已经完成源端网卡发送的 TraceSource 名称。
+作用：触发绑定的 send_finish(send_output, q)，汇总同一上层 flow 已经离开发送端的数据量。
+
+3. q
+含义：完成事件传入回调的 RdmaQueuePair 智能指针。
+作用：向回调提供源地址、目的地址、端口、通信总量、开始时间和完成状态。
+
+4. q->startTime
+含义：当前 QP 开始网络传输时记录的 NS-3 模拟时间。
+作用：与 Simulator::Now() 相减得到该 QP 实际经历的流完成时间。
+
+5. base_rtt
+含义：当前源目节点对在没有额外排队时的基础往返时间。
+作用：作为 qp_finish() 计算 standalone_fct 无竞争基线的固定传播与返回反馈时间部分。
+
+6. b
+含义：当前源目节点对路径上的瓶颈带宽。
+作用：用于计算 standalone_fct 中发送全部数据和协议头所需的理想序列化时间。
+
+7. total_bytes
+含义：QP 有效数据量加上按数据包数量计算的协议头开销后的总传输字节数。
+作用：比只使用 q->m_size 更准确地估计无竞争情况下需要在链路上传输的总比特数。
+
+8. standalone_fct
+含义：按基础 RTT、总传输字节数和路径瓶颈带宽计算的无竞争流完成时间基线。
+作用：与实际 FCT 对比，帮助识别排队、PFC、拥塞降速和反馈等待造成的额外开销。
+
+
+十、SetupNetwork()：ACK 队列与静态路由参数
+==========================================
+
+1. RdmaEgressQueue::ack_q_idx
+含义：ACK 和 NACK 反馈包进入的发送队列编号。
+作用：ACK_HIGH_PRIO 开启时设为 0，让确认和丢包反馈优先发送；关闭时设为 3，使其使用普通 RDMA 优先级队列。
+
+2. nextHop
+含义：按“当前节点—最终目的 GPU”保存一个或多个候选下一跳节点的全局映射表。
+作用：保存 CalculateRoutes() 得到的等价最短路径结果，供 SetRoutingEntries() 转换成本地输出端口并安装到运行时路由表。
+
+3. dstAddr
+含义：最终目的 GPU 在 IPv4 接口 1 上的稳定节点地址。
+作用：作为交换机和 RdmaHw 路由表的查找键，使数据包能够按最终目的地址选择输出端口。
+
+4. interface
+含义：当前节点连接某个候选下一跳的本地 QbbNetDevice 设备编号。
+作用：作为路由表的候选输出端口；数据包运行时根据目的地址和 ECMP 结果从候选端口中选择一个。
+
+5. is_nvswitch
+含义：当前端节点的候选下一跳是否为 NVSwitch 的标志。
+作用：决定该出口写入 RdmaHw 的 NVSwitch 下一跳表还是普通网络下一跳表，从而区分服务器内和跨服务器发送出口。
+
+6. SwitchNode::m_rtTable
+含义：普通交换机按目的 IPv4 地址保存候选输出设备编号的转发表。
+作用：普通交换机收到数据包后根据最终目的地址和 ECMP 哈希选择输出端口。
+
+7. NVSwitchNode::m_rtTable
+含义：NVSwitch 按目的 IPv4 地址保存候选输出设备编号的转发表。
+作用：NVSwitch 收到服务器内转发的数据包后选择通往目标 GPU 的输出端口。
+
+8. RdmaHw::m_rtTable
+含义：GPU 或 NVSwitch 所关联 RdmaHw 中保存的普通网络候选出口表。
+作用：为跨服务器 QP 选择连接普通网络的网卡或端口。
+
+9. RdmaHw::m_rtTable_nxthop_nvswitch
+含义：GPU 或 NVSwitch 所关联 RdmaHw 中保存的 NVSwitch 候选出口表。
+作用：为服务器内 QP 或明确以 NVSwitch 为下一跳的 QP 选择对应端口。
+
+10. nvswitch_set
+含义：RdmaHw 中记录直接相连目的节点编号的集合，名称沿用了 NVSwitch 相关命名。
+作用：当前源码会向集合写入编号，但没有找到读取该集合并影响路由或发送行为的代码，因此目前不产生实际网络效果。
+
+
+十一、SetupNetwork()：GPU 路径 RTT 与 BDP 参数
+==============================================
+
+1. pairDelay
+含义：按“源节点—目的 GPU”保存一条最短路径的累计单向传播延迟。
+作用：参与计算源 GPU 到目的 GPU 在无排队情况下的基础往返时间。
+
+2. pairTxDelay
+含义：按“源节点—目的 GPU”保存一个 PACKET_PAYLOAD_SIZE 大小数据块经过路径各跳的累计序列化时间。
+作用：作为基础 RTT 中的数据发送开销；它反映各跳把该数据块推上链路所需的时间总和。
+
+3. pairBw
+含义：按源节点编号和目的节点编号保存所选最短路径上的最小链路带宽。
+作用：表示该路径的瓶颈带宽，用来计算 BDP 和无竞争流完成时间。
+
+4. delay
+含义：当前源 GPU 到目的 GPU 的累计单向传播延迟。
+作用：乘以 2 后计入正向数据和反向反馈所经历的传播时间。
+
+5. txDelay
+含义：当前源 GPU 到目的 GPU 的标准数据块累计序列化时间。
+作用：与双向传播延迟相加，形成该节点对的基础 RTT 估计值。
+
+6. rtt
+含义：当前源 GPU—目的 GPU 节点对按“2 × 单向传播延迟 + 累计序列化时间”得到的基础往返时间。
+作用：写入 pairRtt，并用于计算该路径的 BDP；它不包含运行时排队、PFC 暂停和拥塞降速等待。
+
+7. bw
+含义：当前源 GPU—目的 GPU 路径的瓶颈带宽。
+作用：与 rtt 相乘并换算为字节，得到路径上可同时容纳的在途数据量。
+
+8. bdp
+含义：当前源 GPU—目的 GPU 的带宽时延积，即一个基础 RTT 内按瓶颈带宽能够传输的字节数。
+作用：写入 pairBdp，为后续 QP 窗口和无竞争性能基线提供路径容量参考。
+
+9. pairRtt
+含义：按源 GPU 编号和目的 GPU 编号保存的基础 RTT 表。
+作用：始终供 qp_finish() 计算具体节点对的无竞争 FCT 基线；只有 GLOBAL_T 能取 0 时才会作为对应 QP 的基础 RTT，而当前读取逻辑会把 GLOBAL_T 强制设为 1。
+
+10. pairBdp
+含义：按源 GPU 对象和目的 GPU 对象保存的 BDP 表。
+作用：设计上可为具体路径提供 QP 窗口，但当前 GLOBAL_T 被强制设为 1，实际 QP 使用 maxBdp，因此这张表在当前默认运行路径中不会被选中。
+
+11. maxRtt
+含义：全部 GPU 节点对基础 RTT 中的最大值。
+作用：在当前 GLOBAL_T=1 时作为所有新建 QP 的统一基础 RTT，同时写入普通 SwitchNode 供需要全局最大往返时间的 PINT 相关计算使用。
+
+12. maxBdp
+含义：全部 GPU 节点对 BDP 中的最大值。
+作用：在当前 GLOBAL_T=1 且 HAS_WIN 开启时作为所有新建 QP 的统一窗口，同时写入追踪文件的 SimSetting.win 供离线分析识别该参考值。
+
+13. SwitchNode::m_ccMode
+含义：普通交换机保存的当前拥塞控制算法编号。
+作用：让交换机在实际转发数据包时决定是否生成 HPCC、TIMELY 或 PINT 等算法需要的反馈信息。
+
+14. SwitchNode::m_maxRtt
+含义：普通交换机保存的全局最大基础 RTT。
+作用：为 HPCC-PINT 等依赖最大 RTT 时间尺度的反馈计算提供统一参考值。
+
+
+十二、SetupNetwork()：追踪、发送准备与链路故障参数
+====================================================
+
+1. trace_num
+含义：TRACE_FILE 文件头声明的待追踪节点编号数量。
+作用：控制后续从文件读取多少个 nid，并据此构造 trace_nodes。
+
+2. nid
+含义：TRACE_FILE 中读取出的一个待追踪节点编号。
+作用：在编号有效时从全局 NodeContainer 中选出对应节点并加入 trace_nodes。
+
+3. trace_nodes
+含义：保存所有有效待追踪节点对象的 NodeContainer。
+作用：限定 EnableTracing() 只给这些节点上的 QbbNetDevice 登记逐包事件回调。
+
+4. trace_output
+含义：由 TRACE_OUTPUT_FILE 路径打开的网络追踪输出文件句柄。
+作用：接收 SimSetting 文件头和运行阶段产生的数据包事件记录。
+
+5. enable_trace
+含义：是否启用逐包网络事件追踪的运行开关。
+作用：开启时为 trace_nodes 中的网卡安装追踪回调；关闭时不记录逐包事件，但仍会创建文件并写入 SimSetting。
+
+6. SimSetting::port_speed
+含义：按“节点编号—本地端口编号”保存的实际端口 bit/s 速率表。
+作用：作为追踪文件的自描述元数据，帮助离线程序还原各端口带宽；该值不会重新设置 QbbNetDevice 的发送速率。
+
+7. SimSetting::win
+含义：写入追踪文件头的全局窗口参考值，当前取 maxBdp。
+作用：让离线分析程序知道模拟网络的最大 BDP；该赋值本身不会改变 QP 的实际发送窗口。
+
+8. portNumber
+含义：按“源节点编号—目的节点编号”保存下一条 QP 使用的源通信端口号，初始值为 10000。
+作用：创建多条 QP 时逐次分配端口号，用于区分同一源—目的节点对的不同通信流；它不是物理网卡设备编号。
+
+9. interPacketInterval
+含义：SetupNetwork() 中创建的 250 纳秒时间值。
+作用：当前版本中没有后续代码读取该变量，因此不会控制真实 RDMA 数据包的发送间隔。
+
+10. flow_input.idx
+含义：旧 FlowInput 状态中保存的流序号字段。
+作用：SetupNetwork() 将它初始化为无符号整数的最大值，SendFlow() 会递增，但当前没有读取者，因此不影响 QP 创建或网络传输。
+
+11. link_down_time
+含义：LINK_DOWN 配置中的链路失效等待时间，单位为微秒。
+作用：大于 0 时在模拟开始 2 秒后再等待该时间，触发指定链路失效；等于 0 时不安排故障事件。
+
+12. link_down_A
+含义：LINK_DOWN 指定的故障链路第一个端点的统一节点编号。
+作用：用于从 NodeContainer 取得链路端点 A，并交给 TakeDownLink()。
+
+13. link_down_B
+含义：LINK_DOWN 指定的故障链路第二个端点的统一节点编号。
+作用：用于从 NodeContainer 取得链路端点 B，并与 link_down_A 一起唯一确定要关闭的链路。

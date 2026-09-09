@@ -1,0 +1,1505 @@
+SimAI Simulation 网络物理传输路线学习总结
+==========================================
+
+文档维护规则（后续每次更新时必须遵守）
+========================================
+
+1. 这是一份持续重构的学习总结，不是按照学习时间不断向文件末尾追加内容的学习日志。
+
+2. 学到新对象、新参数或新调用关系后，必须回头检查已有章节，并把新知识写回它真正所属的位置。例如，学到 RdmaDriver 后，必须同步更新 Node 章节中 Node 通过 AggregateObject 与 RdmaDriver 建立的关系。
+
+3. 不能只更新本次新学到的代码。凡是新知识会改变前文表述、补全对象状态或建立跨模块关系，都必须同时修改前文。
+
+4. 应主动寻找并整理对象之间的联系，包括直接成员、继承关系、AggregateObject 聚合关系、指针引用、回调连接、共享对象以及运行时调用关系，不能把彼此相关的对象写成互不相干的知识点。
+
+5. 正文按照真实物理传输过程组织，不按照 main()、ReadConf()、SetConfig()、SetupNetwork() 的源码调用顺序组织。
+
+6. 正文只写项目知识、对象关系、参数作用和数据传输过程。“本总结需要更新”“后面还要补充”“不能停留在某一阶段”等面向整理者的元叙述，只能写在本维护规则中，不能混入正文。
+
+7. 已经学到但不再准确的内容应直接改写或删除，不能保留旧说法后再在后文追加修正。重复内容应合并到最合适的章节。
+
+8. 对一个对象的介绍必须反映当前学习进度下已经建立的完整状态。例如 Node 章节既要说明 CreateObject<Node>() 后的初始状态，也要说明协议栈、QbbNetDevice、RdmaDriver 和相关回调安装后形成的关系。
+
+9. 尚未进入源码验证的运行阶段不能写成已经确认的项目行为；可以明确标注尚未追踪，但不能根据一般网络知识替代源码结论。
+
+10. 每次更新完成后，应检查前后矛盾、重复章节、失效描述以及当前代码学习边界是否准确。
+
+11. 实验记录必须区分“已准备命令或由工具预检”和“用户已经亲自运行”。只有用户执行命令并看到结果后，才把学习计划中的复现实验标记为已完成。
+
+
+用途
+====
+
+这份文件用于把已经学过的 Simulation 网络路线重新组织成一条容易记忆的物理传输链。
+
+它不按照 main()、ReadConf()、SetConfig()、SetupNetwork() 的程序调用顺序展开，而是从“一块训练数据为什么需要通信”开始，沿着数据真实经过的设备向前走：
+
+GPU 产生待通信数据
+    ↓
+集合通信把一次多人协作拆成多条点到点数据流
+    ↓
+源 GPU 的 RDMA 发送状态和网卡端口
+    ↓
+同一服务器内经过 NVSwitch，或跨服务器进入普通网络
+    ↓
+链路传输、交换机转发、缓存排队和拥塞控制
+    ↓
+目标 GPU 接收数据
+    ↓
+ACK、ECN/CNP、PFC 等反馈反向影响发送速度
+    ↓
+所有数据流完成，形成一次集合通信的网络耗时
+
+一、先建立一幅物理系统图
+==========================
+
+为了便于理解，先假设有两台服务器，每台服务器有 4 张 GPU。每台服务器内部的 GPU 通过 NVSwitch 互连，跨服务器通信需要经过网络端口、链路和普通网络交换机。
+
+服务器 A                                      服务器 B
+┌────────────────────┐                      ┌────────────────────┐
+│ GPU0  GPU1  GPU2  GPU3│                      │ GPU4  GPU5  GPU6  GPU7│
+│   \    |    |    /   │                      │   \    |    |    /   │
+│       NVSwitch       │                      │       NVSwitch       │
+│                      │                      │                      │
+│ GPU 网络端口/网卡     │                      │ GPU 网络端口/网卡     │
+└──────────┬─────────┘                      └──────────┬─────────┘
+           │                                           │
+           └──────普通网络链路──普通网络交换机───────────┘
+
+需要特别注意：当前 NS-3 拓扑通常不把“网卡”单独建成一个 Node。一个 GPU 使用一个普通 NS-3 Node 表示，网卡或网络端口以后作为 QbbNetDevice 挂到这个 Node 上。因此：
+
+真实 GPU 计算与训练状态       主要由 AstraSim::Sys 表示
+GPU 在网络中的端点            由 NS-3 Node 表示
+GPU 上的网卡/网络端口         由 QbbNetDevice 表示
+服务器内部的 NVSwitch         由 NVSwitchNode 表示
+普通数据中心网络交换机        由 SwitchNode 表示
+交换机缓存管理                由 SwitchMmu 表示
+一条物理链路                  由 QbbChannel 表示
+一次点到点 RDMA 传输状态      由 RdmaQueuePair 表示
+
+一张 GPU 在 SimAI 中不是只由一个 C++ 对象完整表示。计算、集合通信调度和网络传输分别由不同对象负责，然后通过相同的 GPU/节点编号关联起来。
+
+
+二、数据为什么会从 GPU 出发
+============================
+
+大模型训练中，一张 GPU 往往只保存并计算整个模型或整个批次的一部分，因此它不能独立完成所有工作。计算到某个阶段时，会产生必须交给其他 GPU 的数据。
+
+目前已经遇到的主要数据包括：
+
+1. 前向通信数据
+
+   常见内容是激活值，也就是前一部分模型计算出的中间结果。采用 PP（不同 GPU 保存不同模型阶段，阶段之间传激活值和梯度）时，前一阶段要把激活值发送给下一阶段。
+
+2. 输入梯度通信数据
+
+   反向传播时，后一个模型阶段计算出“损失对它输入的梯度”，然后把这份梯度发回前一个阶段，使前一个阶段能够继续反向计算。
+
+3. 权重梯度通信数据
+
+   DP（复制多套模型处理不同数据，之后同步相同参数的梯度）中，不同副本处理了不同训练样本，得到的局部梯度也不同。更新参数前，需要通过 AllReduce 等集合通信把梯度汇总。
+
+4. TP 通信数据
+
+   TP（把同一层的参数和计算拆给多张 GPU 合作）中，一层的计算结果分散在多张 GPU 上，经常需要 AllReduce、AllGather 或 ReduceScatter 来组合结果。
+
+5. EP 通信数据
+
+   EP（不同 GPU 保存不同专家，数据按路由发送到相应专家）中，不同 Token 要被发送到保存目标专家的 GPU，常见通信是 AllToAll。
+
+Workload 文件描述“什么时候计算、什么时候通信、通信类型和通信量”。它决定通信需求，但它本身不是物理网络。
+
+在 Simulation 路线中，集合通信会继续被拆成多条点到点流。例如一个环形 AllReduce 可能让 GPU0 向 GPU1 发送一个数据块，GPU1 向 GPU2 发送另一个数据块。NS-3 最终模拟的是这些点到点流所产生的数据包。
+
+
+三、源 GPU：计算对象与网络节点不是同一个对象
+============================================
+
+1. AstraSim::Sys
+
+   Sys 代表一个参与训练和通信调度的逻辑执行单元。它知道当前 workload、集合通信阶段、GPU 分组以及通信何时完成。
+
+   Sys 不是物理网卡，也不负责逐个模拟交换机数据包。
+
+2. Node 的成员与关联对象
+
+   Node 是 GPU 在模拟网络中的端点容器。刚执行 CreateObject<Node>() 时，它主要只有：
+
+   m_id             NS-3 全局唯一节点编号
+   m_sid            多线程仿真使用的系统编号
+   m_node_type       节点类别
+   m_devices         设备列表，刚创建时为空
+   m_applications    NS-3 Application 列表，刚创建时为空
+   m_handlers        数据包到达后的协议处理回调列表
+
+   完成网络协议、链路设备和 RDMA 初始化后，一个普通 GPU Node 的结构为：
+
+   GPU Node
+   ├── m_id、m_sid、m_node_type
+   ├── m_devices
+   │   ├── 设备0：回环设备
+   │   ├── 设备1：第一张真实 QbbNetDevice
+   │   └── 设备2……：其他与物理链路相连的 QbbNetDevice
+   ├── m_handlers：协议和设备收包处理入口
+   ├── 聚合的网络协议对象
+   │   ├── ARP、IPv4、ICMPv4
+   │   ├── UDP、TCP
+   │   ├── TrafficControlLayer
+   │   └── PacketSocketFactory 等
+   └── 聚合的 RdmaDriver
+       ├── m_node：指回当前 Node
+       └── m_rdma：指向该节点的 RdmaHw
+           ├── m_nic：端口与 QP 集合的对应表
+           ├── 发送端/接收端 QP 映射表
+           ├── 普通网络/NVSwitch 下一跳表
+           ├── 拥塞控制和可靠传输参数
+           └── 网卡收发、故障和完成回调
+
+   因此，“Node 里有什么”要分成三层理解：
+
+   Node 直接成员
+       例如 m_devices、m_applications、m_handlers。
+
+   聚合到 Node 的 Object
+       例如 Ipv4L3Protocol、RdmaDriver。可以用 node->GetObject<T>() 找到。
+
+   通过聚合对象间接关联的对象
+       例如 RdmaHw 并没有直接 Aggregate 到 Node，而是由 RdmaDriver::m_rdma 指向。
+
+3. 当前 m_devices、m_applications 分别是什么状态
+
+   m_devices 已经不为空。InternetStackHelper 安装了回环设备，后面每有一条拓扑链路连接该节点，QbbHelper 就为这一端创建一个 QbbNetDevice 并加入 m_devices。
+
+   SetupNetwork 完成时 m_applications 仍为空，因为该函数没有调用 AddApplication。RdmaDriver 继承的是 Object，不是 Application，所以 node->AggregateObject(rdma) 不会把它加入 m_applications。后续上层 Flow 进入 SendFlow() 后，RdmaClientHelper::Install() 才会向源 Node 动态安装发送 Application。
+
+4. NodeContainer n
+
+   n 是保存全部 NS-3 节点智能指针的容器，不是单个节点。
+
+   n.Get(i) 用于取得编号为 i 的节点。拓扑中的 src、dst、sid 等编号最终都要通过 n 找到对应对象。n 只负责保存节点，不自动表示它们之间是否相邻；相邻关系来自拓扑文件的链路记录和 nbr2if。
+
+5. node_type 与 m_node_type
+
+   node_type[i] 是建立拓扑时使用的临时分类表，用它决定第 i 个节点应该创建成哪个类。
+
+   m_node_type 是节点创建后保存在对象内部的类别：
+
+   0    普通 GPU 网络端点
+   1    普通数据中心网络交换机 SwitchNode
+   2    NVSwitchNode
+
+   SwitchNode 和 NVSwitchNode 都继承 Node，所以也拥有 Node 的设备、协议和回调；同时又增加自己的转发表、端口统计和 SwitchMmu 等状态。
+
+6. Node 上安装的网络协议对象
+
+   InternetStackHelper 会创建 ARP、IPv4、ICMPv4、UDP、TCP、流量控制等独立对象，再通过 AggregateObject 挂到 Node 上。“安装协议栈”不是把协议源码复制到 Node 内部。
+
+   factory
+       ObjectFactory 类型的局部对象。它保存要创建的 TypeId 和属性，再根据注册构造函数创建真正对象。
+
+   protocol
+       Ptr<Object> 类型的通用智能指针。它的静态类型是 Object，实际对象由 factory 中的 TypeId 决定，例如 Ipv4L3Protocol 或 ArpL3Protocol。
+
+   Ipv4L3Protocol
+       保存 IPv4 接口、地址和路由对象，并提供 AddInterface、AddAddress、Send、Receive 等入口。serverAddress 和每链路 10.x.x.x 地址保存在它管理的 Ipv4Interface 中，不是 Node 直接成员。
+
+   回环设备
+       用于同一节点内部通信，不经过 QbbChannel，通常占设备编号 0。因此真实 QbbNetDevice 通常从编号 1 开始，交换机端口遍历和 RdmaHw 接口组织都需要考虑这个编号关系。
+
+7. Node、QbbNetDevice、QbbChannel 和 RdmaHw 不是重复表示同一个东西
+
+   Node 表示完整网络端点或交换节点。
+
+   QbbNetDevice 表示 Node 上的一张网卡或一个交换机端口，保存在 Node::m_devices 中。
+
+   QbbChannel 表示连接两个 QbbNetDevice 的点到点物理信道，由端口持有指针，不是 Node 内部的一张网卡。
+
+   RdmaHw 表示端侧 RDMA 发送、确认和拥塞控制逻辑。RdmaInterfaceMgr::dev 再次指向 Node::m_devices 中已有的同一个 QbbNetDevice，并没有创建第二张网卡。
+
+8. Node 中仍然没有什么
+
+   即使完成当前初始化，Node 里仍然没有 workload、模型参数和 GPU 计算时间；这些属于 AstraSim::Sys。
+
+   当前也还没有真实通信 QP。每个端口的 RdmaQueuePairGroup 已经建立，但要等后续上层通信请求进入 AddQueuePair 才会装入 QP。
+
+   自定义路由已经完成初始化。CalculateRoutes(n) 根据 nbr2if 计算到每个 GPU 目的节点的候选下一跳，SetRoutingEntries() 再把目标地址到端口的映射写入 RdmaHw、SwitchNode 和 NVSwitchNode。此时只有转发表和空的 QP 容器，仍然没有真实通信 QP 或 Packet。
+
+
+四、一次点到点传输怎样由 QP 保存状态
+====================================
+
+RDMA 的全称是 Remote Direct Memory Access。真实系统中，它让网卡直接在本机和远端内存之间搬运数据，尽量避免 CPU 参与每一份数据的复制。
+
+当前模拟器并不真的读写 GPU 显存，而是模拟 RDMA 在网络中的分包、发送、确认、限速和完成过程。
+
+一次集合通信被拆成 GPU0→GPU1 的点到点数据流后，会建立或找到相应的 QP。QP 可以理解为“保存这一次点到点 RDMA 传输状态的对象”，不是必须经过 TCP 握手的连接。
+
+当前虽然还没进入真实 AddQueuePair，但 QP 将要依赖的组织结构已经在 Node 初始化时接好：
+
+Node
+    ↓ 聚合
+RdmaDriver
+    ↓ m_rdma
+RdmaHw
+    ↓ m_nic[nic_idx]
+RdmaInterfaceMgr
+    ├── dev：实际 QbbNetDevice
+    └── qpGrp：该端口的 RdmaQueuePairGroup
+                    ↓ m_qps
+                 多个 QP
+                    ↓ 运行时按需生成
+                 多个 Packet
+
+RdmaDriver 是上层请求入口，RdmaHw 保存和操作 QP，RdmaInterfaceMgr 把端口与 QP 集合配对，RdmaQueuePairGroup 才是使用同一端口的 QP 容器。
+
+RdmaDriver::Init() 已经为 Node 的每个设备创建一项 RdmaInterfaceMgr：
+
+回环设备
+    dev=NULL，保留索引但 Setup 时跳过。
+
+真实 QbbNetDevice
+    dev 指向 Node::m_devices 中的同一个端口对象，并创建独立 qpGrp。
+
+随后 RdmaHw::Setup() 把：
+
+dev->m_rdmaEQ->m_qpGrp
+
+指向同一个 qpGrp。这里共享的是智能指针，不是复制 QP。因此 RdmaHw 添加一个 QP 后，网卡发送队列会立即在同一个集合中看到它。
+
+已经遇到的 QP 状态包括：
+
+字段或概念          含义
+------------------  --------------------------------------------------
+m_src / m_dest      源节点和目标节点
+m_size              这条流还需要传输多少数据
+m_init_size         这条流最初的数据总量
+snd_nxt             下一个准备发送的字节/序号位置
+snd_una             已发送但尚未确认的起始位置
+m_win               最多允许多少数据处于“已发送但未确认”状态
+m_rate              当前允许的发送速率
+m_max_rate          没有拥塞限制时的最高发送速率
+m_nextAvail         拥塞限速后，下一次允许发送数据包的模拟时间
+m_baseRtt           没有额外排队时的基础往返时间
+m_pg                数据所属的优先级队列
+
+一个简单的数据流是：
+
+1 MiB 通信数据
+    ↓
+放入 GPU0→GPU1 对应的 QP
+    ↓
+按照单包大小拆成多个网络数据包
+    ↓
+网卡按照 m_rate 和 m_nextAvail 逐个发送
+    ↓
+GPU1 返回 ACK（确认哪些数据已经收到）
+    ↓
+GPU0 更新 snd_una 和剩余数据量
+    ↓
+全部数据完成后通知上层集合通信
+
+如果交换机反馈拥塞，QP 的 m_rate 会降低，m_nextAvail 会推迟，完成这条流所需的模拟时间就会增加。
+
+真正创建 QP 后，RdmaHw 会先通过 GetNicIdxOfQp() 选择 nic_idx，再把 QP 加入：
+
+m_nic[nic_idx].qpGrp
+
+以后 RdmaEgressQueue 会遍历这个组，检查每个 QP 是否：
+
+仍有数据可发
+没有被对应优先级的 PFC 暂停
+没有超过发送窗口
+已经到达 m_nextAvail
+
+选中一个 QP 后，端口再通过 m_rdmaGetNxtPkt 回调让 RdmaHw 根据 MTU、剩余字节和序号生成下一个数据包。因此 QP 集合不是 Packet 队列；Packet 是选择 QP 之后临时生成的。
+
+
+五、同一服务器内：GPU → NVSwitch → GPU
+========================================
+
+NVSwitch 是服务器内部连接多张 GPU 的高速交换芯片。它让 GPU 之间通过 NVLink 等高速互连交换数据，而不必绕到普通数据中心网络中。
+
+在当前 NS-3 模型中，NVSwitch 使用 NVSwitchNode 表示，其 m_node_type 为 2。
+
+一个 NVSwitchNode 除了继承普通 Node 的编号、设备列表、协议对象和处理回调，还保存：
+
+m_rtTable           目标地址到输出端口的转发表
+m_ecmpSeed          多条可用路径之间进行选择的哈希种子
+m_bytes             不同输入端口、输出端口和优先级上的字节统计
+m_txBytes           各端口累计发送的字节数
+m_lastPktSize       上一个数据包大小
+m_lastPktTs         上一个数据包的发送时间
+m_u                 端口利用率相关状态
+m_mmu               NVSwitch 使用的缓存管理对象
+
+当前初始化完成后，NVSwitchNode 也已经拥有：
+
+连接各 GPU/端口的 QbbNetDevice
+每个端口对应的 QbbChannel
+按端口配置的 headroom 和动态 PFC 参数
+按 BUFFER_SIZE 配置的 SwitchMmu 总缓存
+聚合的 RdmaDriver，以及它指向的 RdmaHw
+
+之所以 m_node_type=2 也创建 RdmaDriver/RdmaHw，是因为当前工程允许 NVSwitchNode 承担服务器内部/NVLS 相关端侧功能，而不只是一个完全透明的普通二层交换芯片。真实 NVSwitch 的硬件组织与这里的 NS-3 对象抽象不能完全等同。
+
+同一服务器内部的物理传输可以先理解为：
+
+源 GPU 的 QP
+    ↓
+RdmaHw 根据同服务器关系选择 NVSwitch 下一跳表
+    ↓
+对应 RdmaInterfaceMgr 中的 QbbNetDevice 端口
+    ↓
+GPU 与 NVSwitch 之间的高速链路
+    ↓
+NVSwitchNode 根据目标地址选择输出端口
+    ↓
+目标 GPU 的 QbbNetDevice
+    ↓
+目标端的 RDMA 接收状态
+
+同服务器判断使用：
+
+src / m_gpus_per_server == dst / m_gpus_per_server
+
+例如每台服务器 4 张 GPU，GPU1→GPU3 的整数除法结果都为 0，因此选择 m_rtTable_nxthop_nvswitch；GPU1→GPU6 的结果分别为 0 和 1，因此选择普通网络 m_rtTable。
+
+这个判断只决定 RdmaHw 应从哪一类端口发送，不负责自动创造物理连接。GPU 与 NVSwitch 的具体端口对应关系仍然来自拓扑文件中的链路记录、QbbHelper 安装结果和后续路由表。
+
+SetRoutingEntries() 已经把服务器内部路径安装到两类对象：NVSwitchNode::m_rtTable 供到达 NVSwitch 的数据包继续查表转发，RdmaHw::m_rtTable_nxthop_nvswitch 供端侧创建 QP 时选择通向 NVSwitch 的本地端口。普通跨服务器出口则保存在 RdmaHw::m_rtTable。
+
+GPU 分支还会在 next 与 dst 是同一个节点时调用 add_nvswitch(dst->GetId())，把编号放进 nvswitch_set。当前源码没有任何读取 nvswitch_set 的位置，因此它不影响路由或通信耗时；函数名与实际写入条件也不完全一致，应视为未使用的遗留状态，不能把它当成有效的 NVSwitch 路由依据。
+
+目前已经遇到的服务器内部参数：
+
+gpus_per_server
+    每台服务器包含多少张 GPU。它用于把 GPU 编号分组，并判断哪些 GPU 属于同一服务器。
+
+nvswitch_num
+    整个拓扑中 NVSwitch 节点的数量。它和普通网络交换机数量分开统计。
+
+NVswitchs
+    保存所有 NVSwitch 节点编号的数组。
+
+nvswitch_id
+    某个逻辑执行单元对应的 NVSwitch 编号，用于识别它所属的服务器内部交换域。
+
+gpu_type / gpu_type_str
+    GPU 型号，例如 A100、A800、H100、H800。字符串从拓扑文件读取，再转成 GPUType 枚举，后面供集合通信和硬件能力相关模型使用。
+
+nvlink_bw
+    GPU 与服务器内部高速互连相关的带宽参数。当前只需要知道它描述服务器内部通信能力，后续在链路或带宽模型真正使用时再补充。
+
+nv_latency
+    GPU 与 NVSwitch 链路的传播延迟，由拓扑生成配置决定。
+
+
+六、跨服务器：GPU 网络端口 → 普通网络 → 目标 GPU
+==================================================
+
+跨服务器通信时，数据不能只经过 NVSwitch，而要进入数据中心网络：
+
+源 GPU
+    ↓
+源端 QbbNetDevice（模拟网卡/网络端口）
+    ↓
+QbbChannel（模拟链路）
+    ↓
+SwitchNode（普通网络交换机）
+    ↓
+一条或多条后续链路与交换机
+    ↓
+目标 GPU 的 QbbNetDevice
+    ↓
+目标 RDMA 接收状态
+
+当前模型中，网卡通常不是独立 Node，而是挂在 GPU Node 上的 QbbNetDevice。一个节点可能有多个设备，每个设备都有自己的端口编号、发送速率、发送队列和连接的信道。
+
+结合当前已经建立的 RDMA 对象，源端实际关系是：
+
+Astra-Sim 后续提出点到点发送请求
+    ↓
+从源 Node 取得聚合的 RdmaDriver
+    ↓
+RdmaDriver 把请求交给 RdmaHw
+    ↓
+RdmaHw 根据服务器归属和路由表选择 m_nic[nic_idx]
+    ↓
+RdmaInterfaceMgr::qpGrp 保存该 QP
+    ↓
+对应 QbbNetDevice 的 RdmaEgressQueue 从该组调度发包
+
+RdmaDriver 不是脱离 Node 的全局对象，而是每个可进行 RDMA 通信的端节点各自聚合一个。其他代码通过 node->GetObject<RdmaDriver>() 找到正确源节点或目标节点的 RDMA 状态。
+
+拓扑文件中的每条链路记录由以下字段组成：
+
+src  dst  data_rate  link_delay  error_rate
+
+例如：
+
+0  9  400Gbps  0.0005ms  0
+
+表示节点 0 与节点 9 之间建立一条链路：
+
+src = 0
+    链路一端的节点编号。
+
+dst = 9
+    链路另一端的节点编号。
+
+data_rate = 400Gbps
+    链路每秒能够串行发送的比特数。数据包越大、速率越低，把数据包全部推入链路所需的时间越长。
+
+link_delay = 0.0005ms
+    数据包在链路上传播的固定延迟。
+
+error_rate = 0
+    这条链路的数据包错误概率为 0。
+
+拓扑文件不使用参数名，而是按空白分隔的固定位置顺序读取。一条 src—dst 记录本身就是“两个节点直接相邻”的声明；程序不是通过 IP 地址或距离自动推测相邻关系。
+
+1. 一条物理链路实际创建了什么
+
+   QbbHelper 的 ObjectFactory 会为 src 和 dst 分别创建一个 QbbNetDevice，再创建一个两端共享的 QbbChannel：
+
+   src Node
+       ↓
+   QbbNetDevice A（src 的本地端口和发送队列）
+       ↓
+   QbbChannel（点到点传播信道）
+       ↓
+   QbbNetDevice B（dst 的本地端口和发送队列）
+       ↓
+   dst Node
+
+   qbb.Install(snode, dnode) 返回 NetDeviceContainer d：d.Get(0) 是 src 侧端口，d.Get(1) 是 dst 侧端口。两个端口各自有编号和队列，中间共享同一条信道，因此这是一条双向点到点链路。
+
+2. 带宽、传播延迟和错误率放在哪里
+
+   DataRate
+       设置到链路两端的 QbbNetDevice。它决定端口把数据包的全部比特推入信道需要多久：发送序列化时间 = 数据包比特数 ÷ 端口带宽。
+
+   Delay
+       设置到 QbbChannel。它表示数据包从信道一端传播到另一端的固定时间。
+
+   ReceiveErrorModel
+       设置到 QbbNetDevice 的接收路径。数据包到达后，RateErrorModel 按概率决定包是否损坏；损坏的包在 QbbNetDevice::Receive 中被丢弃，不再向后传递。
+
+   如果拓扑链路自己的 error_rate > 0，使用这条链路的专属值；否则使用网络配置中的 ERROR_RATE_PER_LINK 全局默认值。因此拓扑文件中的 0 表示“使用全局默认”；只有全局默认也是 0 时，链路才真正不会因该模型随机丢包。
+
+3. 错误模型的随机种子和随机数流
+
+   NS-3 使用可重现的伪随机数。RngSeed 是全局初始种子，RngRun 用于在同一组实验中切换独立重复运行，stream 用于给不同随机事件分配分开的确定性随机序列。
+
+   uv->SetStream(50) 不是把随机数设为 50，而是让该 UniformRandomVariable 使用编号 50 的随机数流。相同的 seed、run 和 stream 会产生完全相同的数字序列，便于重现丢包实验。当前 SimAI 路线没有显式修改它们时，NS-3 默认 RngSeed=1、RngRun=1。
+
+   当前代码为多个按链路创建的随机数对象都显式使用 stream 50。多个独立生成器在 seed、run、stream 完全一样时可能产生相同的误包序列，这是后续真正研究随机链路误码时需要注意的实现细节；当前默认误包率为 0，所以默认实验不受它影响。
+
+4. Node、Ipv4Interface 和 QbbNetDevice 的关系
+
+   Node
+       表示整个网络节点，保存协议对象、路由环境和所有端口。
+
+   Ipv4Interface
+       表示 IPv4 层看到的一个本地接口，保存该接口的 IP 地址、掩码和启用状态。它同时绑定 Node 和 QbbNetDevice：绑定 Node 用于确定它属于哪台机器和哪个协议栈，绑定 QbbNetDevice 用于确定数据包最终从哪个物理端口和队列送出。
+
+   QbbNetDevice
+       表示真正的模拟网卡/交换机端口，保存端口编号、MAC 地址、发送队列、带宽、PFC 暂停状态和所连接的 QbbChannel。
+
+   Node::AddDevice 建立“这张网卡属于这个节点”；Ipv4::AddInterface 则进一步建立“IPv4 地址/路由接口对应这个具体端口”。两者不重复。
+
+5. 稳定节点地址与每链路接口地址
+
+   serverAddress
+       GPU 和 NVSwitch 的稳定节点身份地址，按节点编号生成 11.x.x.1，使用 255.0.0.0（/8）掩码。后续定制 RDMA 转发表主要用它表示“数据最终要到哪个节点”。
+
+   10.x.x.x 链路接口地址
+       程序根据链路序号 i 为每条物理链路创建独立的 10.A.B.0/24 子网。Ipv4AddressHelper::Assign 通常给 d.Get(0) 分配 .1，给 d.Get(1) 分配 .2，并把两个接口设置为启用。它表示“这个具体端口属于哪条点到点链路”。
+
+   因此第一个真实接口可能同时保存 11.x.x.1/8 稳定节点地址和 10.A.B.1/24 链路地址。这不冲突：一个 IPv4 接口可以保存多个地址。
+
+6. nbr2if：直接邻居到本地端口的映射
+
+   nbr2if[当前节点][直接邻居] 保存一个项目自定义 Interface 结构：
+
+   idx
+       本节点去该邻居时应使用的 NetDevice 编号。它是 Node 内部的网卡/端口编号，不要和 IPv4 接口编号混为一谈。
+
+   up
+       链路当前是否可用。路径计算遇到 up=false 会跳过该链路。
+
+   delay
+       从 QbbChannel 读取的传播延迟，后续路径计算会按跳累加。
+
+   bw
+       从 QbbNetDevice 读取的 bit/s 带宽，后续用于计算包发送时间和路径瓶颈带宽。
+
+   Ipv4Interface 的映射方向是“本地端口 → 本节点的 IP 属性和协议栈”；nbr2if 的映射方向是“直接邻居 → 本地出口和链路参数”。后续路由计算遍历 nbr2if[now] 就能得到 now 的所有直接邻居。
+
+   一条双向链路要保存两个方向：nbr2if[src][dst] 保存 src 侧的本地端口，nbr2if[dst][src] 保存 dst 侧的本地端口。两端的带宽和传播延迟目前相同，但端口编号可以不同。
+
+7. 链路端口的 PFC 事件回调
+
+   每个 QbbNetDevice 的 QbbPfc TraceSource 都连接到 get_pfc 日志函数。MakeBoundCallback 在注册时预先绑定 pfc_file 和具体 QbbNetDevice；事件发生时再传入 type，其中 1 表示 pause，0 表示 resume。日志记录事件时间、节点编号、节点类型、端口编号和事件类型。
+
+   该回调只负责观察和记录，不是 PFC 行为本身。QbbNetDevice 真正收到 PFC 包时，通过 m_paused[qIndex]=true 暂停指定优先级队列，收到恢复包时调用 Resume(qIndex)。QbbPfc 回调只是在这两个时刻把事件写入文件。
+
+8. 从直接邻居关系生成端到端路由
+
+   CalculateRoutes(n) 只把 GPU 节点依次作为最终目的节点，并对每个目的 GPU 调用 CalculateRoute(host)。CalculateRoute 从目的 GPU 反向遍历 nbr2if：dis 保存链路跳数，delay 保存累计传播延迟，txDelay 保存一个 PACKET_PAYLOAD_SIZE 数据块经过各跳的累计序列化时间，bw 保存路径上的最小带宽。
+
+   遍历只继续展开普通交换机和 NVSwitch；遇到 GPU 时可以形成到该 GPU 的路由，但不会把 GPU 当作中间转发节点继续扩展。nextHop[当前节点][目的GPU] 最终保存一个或多个最短跳数候选下一跳。存在多条同跳数路径时可以保留多个候选端口；当前候选中已经存在 NVSwitch 路径时，普通交换机候选不会再与它并存，体现项目对服务器内 NVSwitch 路径的优先处理。
+
+   SetRoutingEntries() 把 nextHop 转换成运行对象真正使用的表：
+
+   普通 SwitchNode
+       m_rtTable[目的IP] 保存一个或多个普通交换机输出端口。
+
+   NVSwitchNode
+       自身 m_rtTable 保存数据包转发出口；其聚合 RdmaHw 的 m_rtTable_nxthop_nvswitch 保存 RDMA 侧的 NVSwitch 出口分类。
+
+   GPU Node
+       如果第一跳是 NVSwitch，端口写入 m_rtTable_nxthop_nvswitch；否则写入普通 m_rtTable。
+
+   路由表保存的是“最终目的 IP → 候选本地设备编号”，不是完整路径中的所有节点。运行时交换机再根据数据包源地址、目的地址和端口进行 ECMP 哈希，从候选端口中选择一个出口。
+
+9. 每对 GPU 的基础 RTT 和 BDP
+
+   路由计算后，程序遍历所有源 GPU—目的 GPU 组合，读取 pairDelay、pairTxDelay 和 pairBw，并计算：
+
+   rtt = 2 × 单向累计传播延迟 + 一个有效载荷数据块的正向累计序列化时间
+
+   bdp = rtt × 路径瓶颈带宽 ÷ 10^9 ÷ 8
+
+   pairRtt 和 pairBdp 各自只保存一组代表性最短路径参数，不为每条 ECMP 候选路径分别保存数值；等长路径之间不同的运行时排队也不在这里计算。maxRtt 和 maxBdp 分别取所有 GPU 对中的最大值，而且两者不一定来自同一对 GPU。
+
+   当前 ReadConf() 会把 GLOBAL_T 强制设为 1，因此后续每条 QP 使用 maxRtt 和 maxBdp 作为统一基础 RTT 与窗口，而不是使用 pairRtt/src,dst 和 pairBdp/src,dst。pairRtt 仍用于计算 standalone_fct 无竞争基线。maxRtt 还写入普通 SwitchNode，仅在后续 HPCC-PINT 端口负载估计中使用；其他拥塞控制模式下该交换机属性不产生作用。
+
+一条没有拥塞的数据包，其基础网络时间至少包含：
+
+发送序列化时间
+    约等于 数据包比特数 ÷ 链路比特率。
+
+链路传播时间
+    来自 link_delay。
+
+每一跳的转发处理和事件调度时间
+    由 NS-3 的离散事件逐步推进。
+
+发生并发通信后，还会增加：
+
+交换机排队等待
+PFC 暂停等待
+拥塞控制降低速率产生的等待
+丢包或确认机制带来的额外等待
+
+因此 Simulation 路线不是把“通信量 ÷ 带宽”作为最终结果，而是让数据包在网络对象之间真实经历这些事件，再用完成时刻减去开始时刻得到通信时间。
+
+
+七、普通交换机：转发与排队发生在哪里
+======================================
+
+普通数据中心网络交换机使用 SwitchNode 表示，其 m_node_type 为 1。
+
+SwitchNode 不是与 Node 平行的完全独立对象，而是继承 Node。因此它同时拥有：
+
+Node 的编号、设备列表、协议对象和处理回调
+    +
+交换机自己的转发表、ECMP、流量统计和 SwitchMmu
+
+每条连接普通交换机的拓扑链路，都会在它的 m_devices 中增加一个 QbbNetDevice。设备 0 仍是回环设备，所以交换机网络端口配置循环从 j=1 开始。
+
+SwitchNode 包含的关键状态有：
+
+m_rtTable
+    转发表。给定目标 IP 地址，找到一个或多个可用输出端口。
+
+m_ecmpSeed
+    ECMP 的哈希种子。ECMP 是“存在多条代价相同的路径时，根据一条流的源地址、目标地址和端口等信息选择一条路径”。
+
+active_ports
+    当前实际连接并参与工作的交换机端口。
+
+m_bytes
+    记录数据从哪个输入端口进入、准备从哪个输出端口离开、属于哪个优先级，以及占用多少字节。
+
+m_txBytes
+    每个端口累计发送的字节数，可用于计算端口利用率和生成监控数据。
+
+m_ecnEnabled
+    是否允许交换机在拥塞时设置 ECN 标记。
+
+m_mmu
+    指向 SwitchMmu，负责缓存准入、占用统计、PFC 判断和 ECN 判断。
+
+物理链路创建后，SetupNetwork 已经根据每个端口的真实属性更新 SwitchNode：
+
+1. 从 QbbNetDevice 读取端口 rate。
+
+2. 用 rate 在 KMIN_MAP、KMAX_MAP、PMAX_MAP 中查找匹配项，并把 ECN 参数写入该端口。缺少任一速率配置都会触发断言。
+
+3. 从 QbbChannel 读取 delay，根据 rate 和 delay 计算该端口 headroom。
+
+4. 根据端口速率与 GPU nic_rate 的比例设置 pfc_a_shift。
+
+5. 使用 GetNDevices()-1 配置真实端口数，排除回环设备。
+
+6. 把 BUFFER_SIZE 从 MiB 转成字节写入 SwitchMmu，并记录 SwitchMmu::node_id。
+
+这些参数完成后，SetRoutingEntries() 已经进一步填好 m_rtTable：键是最终目的 GPU 的稳定 IP，值是一个或多个候选输出设备编号。此时交换机已经具备静态转发条件，但还没有 Packet 进入队列；ECMP 选择、缓存准入和排队要等运行阶段才发生。
+
+SetupNetwork 还把 cc_mode 和 maxRtt 写入每个普通 SwitchNode。cc_mode 决定后续普通交换机是否生成 HPCC 完整逐跳信息或 HPCC-PINT 压缩状态；maxRtt 只在 HPCC-PINT 的端口负载估计阶段作为时间尺度。NVSwitchNode 当前没有这两个属性，因此不执行同样的逐跳遥测逻辑。
+
+数据包进入普通交换机后的逻辑路径是：
+
+交换机某个输入端口收到数据包
+    ↓
+根据目标地址查转发表
+    ↓
+ECMP 在候选输出端口中选一个
+    ↓
+SwitchMmu 判断缓存能否接纳
+    ↓
+数据包进入该输出端口的优先级队列
+    ↓
+等待端口空闲
+    ↓
+从输出端口发送到下一条链路
+
+如果很多 GPU 同时把数据发向同一个出口，数据包到达速度大于出口发送速度，队列会增长，这就是网络排队延迟的直接来源。
+
+需要区分两类状态：
+
+SwitchNode::m_rtTable
+    决定数据包准备从哪个输出端口离开。
+
+QbbNetDevice 的实际输出队列和发送状态
+    决定数据包要等待多久才能使用该输出端口。
+
+转发表本身不保存 Packet，也不直接产生排队时间；多个数据包选择相同的忙碌输出端口后，排队才真正出现。
+
+
+八、SwitchMmu：交换机缓存管理与拥塞判断
+=======================================
+
+这里的 MMU 是交换机缓存管理单元，不是 CPU 中负责虚拟地址转换的 MMU。
+
+SwitchMmu 由 SwitchNode 或 NVSwitchNode 持有。它本身主要保存缓存字节计数并作出判断，真正的 Packet 对象仍放在端口队列中：
+
+SwitchNode（继承 Node）
+├── m_devices：多个 QbbNetDevice 输入/输出端口
+└── m_mmu：全交换机共享的缓存状态和判断器
+
+QbbNetDevice 保存 Packet 和发送状态；SwitchMmu 记录这些 Packet 占用了多少缓存，以及是否应当接纳、标记或暂停。
+
+已经遇到的关键状态：
+
+buffer_size
+    交换机总缓存容量。构造时有默认值，当前 SimAI.conf 的 BUFFER_SIZE=32，后续按 32 MiB 配置。
+
+reserve
+    为每个端口、每个优先级保留的基本缓存空间，当前构造默认值为 4 KiB。
+
+headroom
+    发出 PFC 后，已经在链路传输、无法瞬间停止的数据仍需要缓存，headroom 用来容纳这部分数据。当前按端口带宽和传播延迟计算：
+
+    headroom = rate × delay ÷ 8 ÷ 10^9 × 3
+
+    时间步按纳秒时，rate×delay÷8÷10^9 近似为一段单向传播时间内的在途字节数，代码再乘 3 作为额外余量。
+
+resume_offset
+    队列下降到恢复阈值时预留的安全距离，当前默认 3 KiB，避免刚恢复就马上再次暂停。
+
+pfc_a_shift
+    动态 PFC 阈值使用的右移位数。当前阈值计算是：
+
+    PFC阈值 = 当前剩余可共享缓存 >> pfc_a_shift[port]
+
+    shift=3 约等于剩余共享缓存的 1/8，shift=2 约为 1/4，shift=1 约为 1/2，shift=0 约为全部。
+
+    SetupNetwork 先令 shift=3；交换机端口每比 GPU nic_rate 快一倍，就把用于比较的 rate 除以 2 并把 shift 减 1。因此高速端口在当前模型中允许使用更大的共享缓存比例，用来近似补偿它在反馈到达前可能更快注入或汇聚数据。
+
+ingress_bytes
+    每个入口端口、每个优先级已经占用的缓存字节数。
+
+egress_bytes
+    每个出口端口、每个优先级正在排队的字节数。
+
+hdrm_bytes
+    当前使用的 headroom 字节数。
+
+paused
+    某入口端口、某优先级是否已经处于暂停状态。
+
+SwitchMmu 主要参与三个决定：
+
+1. 缓存准入
+
+   CheckIngressAdmission() 比较数据包加入后的 headroom 和共享缓存占用。二者都无法容纳时返回 false，交换机转发路径可以据此拒绝该包。
+
+   UpdateIngressAdmission() 再把已接纳数据按当前占用计入 reserve、共享缓存或 headroom。数据离开时，RemoveFromIngressAdmission() 和 RemoveFromEgressAdmission() 扣除相应计数。
+
+2. PFC 暂停与恢复
+
+   CheckShouldPause() 在当前端口/优先级尚未暂停，并且已经使用 headroom 或共享占用达到动态阈值时返回 true。
+
+   CheckShouldResume() 要求 headroom 已经清空，并且共享占用相对暂停阈值至少空出 resume_offset，才允许恢复。这形成暂停阈值与恢复阈值之间的滞回区，减少反复 pause/resume。
+
+3. ECN 拥塞标记
+
+   ShouldSendCN() 读取出口队列 egress_bytes：
+
+   队列不超过 kmin
+       不标记。
+
+   队列位于 kmin 与 kmax 之间
+       标记概率从 0 逐渐增长到 pmax。
+
+   队列超过 kmax
+       确定标记。
+
+   普通 SwitchNode 在当前初始化阶段配置了这些 ECN 参数；NVSwitchNode 的对应分支只配置 headroom、PFC 和总缓存，没有调用 ConfigEcn。因此不能假定二者当前执行完全相同的 ECN 行为。
+
+
+九、两条拥塞反馈路径怎样反向影响发送
+======================================
+
+网络拥塞不会只增加交换机中的排队时间，还会通过反馈改变源端的发送行为。
+
+这也是 Node、RdmaDriver、RdmaHw、QP 和 QbbNetDevice 之间关系真正产生作用的地方：
+
+Node
+    找到本节点聚合的 RdmaDriver
+        ↓
+RdmaDriver::m_rdma
+    找到负责该节点传输的 RdmaHw
+        ↓
+RdmaHw 根据报文地址和端口找到对应 QP
+        ↓
+更新 QP 的 m_rate、m_nextAvail、确认位置或恢复状态
+        ↓
+QbbNetDevice/RdmaEgressQueue 按更新后的状态决定何时还能发下一个包
+
+发送速率不是 Node 自己控制的。Node 只是容器；真正的每流发送速率保存在 QP 中，由 RdmaHw 的拥塞控制逻辑更新，最后通过 m_nextAvail 和发包回调影响 QbbNetDevice 的实际调度。
+
+1. ECN/CNP：让源网卡降低发送速率
+
+ECN 是交换机在数据包上写入的拥塞标记。CNP 是接收端看到 ECN 后，返回给发送端的拥塞通知报文。
+
+路径是：
+
+交换机出口队列增长
+    ↓
+SwitchMmu 判断需要标记
+    ↓
+SwitchNode 给数据包设置 ECN
+    ↓
+目标 GPU 的 RDMA 接收端看到 ECN
+    ↓
+通过 ACK/CNP 把拥塞信息传回源 GPU
+    ↓
+源端修改 QP 的 m_rate
+    ↓
+下一批数据包之间的发送间隔变大
+    ↓
+集合通信完成时间增加
+
+当前配置 CC_MODE=1，对应 Mellanox 风格的 DCQCN。它主要依靠 ECN/CNP，而不是让每台交换机写入完整的逐跳状态。
+
+当前 SetupNetwork 已经把 DCQCN 需要的参数写入每个 RdmaHw：
+
+EwmaGain
+    决定新拥塞反馈在 alpha 中占多大权重。
+
+ClampTargetRate
+    决定收到拥塞反馈时是否立刻压低目标速率。
+
+AlphaResumInterval
+    决定多快衰减旧拥塞影响。
+
+RPTimer、FastRecoveryTimes
+    决定何时以及经过多少次恢复阶段后切换增长方式。
+
+RateAI、RateHAI
+    分别是主动增长和高速增长的速率步长。
+
+MinRate
+    限制拥塞降速不能无限降低。
+
+RateBound
+    决定计算出的 QP 速率是否真正改变下一包可发送时间。
+
+此处只是完成参数写入。队列尚未产生数据、ECN 尚未标记、CNP 尚未返回，因此 DCQCN 的运行闭环还没有真正发生；后续追踪数据包时要再次进入这些参数的使用函数。
+
+2. PFC：让上游某个优先级暂时停止发送
+
+PFC 是按优先级暂停链路发送的流控机制。
+
+路径是：
+
+交换机入口缓存接近危险阈值
+    ↓
+交换机生成 PFC 暂停报文
+    ↓
+上游 QbbNetDevice 收到暂停报文
+    ↓
+把相应优先级标记为 paused
+    ↓
+该优先级的数据包暂时不能出队
+    ↓
+交换机缓存下降后发送恢复报文
+    ↓
+上游恢复发送
+
+PFC 可以减少因缓存溢出造成的丢包，但暂停会向上游传播，并直接增加通信等待时间。
+
+PFC 与 ECN/CNP 的控制位置不同：
+
+PFC
+    QbbNetDevice 收到 pause 后直接把某优先级标成 paused，该类包暂时不能从端口出队。
+
+ECN/CNP
+    不直接暂停端口，而是让 RdmaHw 修改某个 QP 的发送速率和下一次可发送时间。
+
+每条链路注册的 QbbPfc TraceSource 只负责把 pause/resume 写入日志，不是 PFC 行为本身。
+
+NIC_TOTAL_PAUSE_TIME 原本打算模拟 PCIe 侧造成的额外暂停。PCIe 是服务器内部连接 GPU、CPU 和 NIC 的通用高速通道。但当前代码只把值保存到 m_total_pause_times，没有任何运行函数读取，因此目前不会增加真实的 pause 事件或网络耗时。
+
+
+十、不同拥塞控制方式需要什么网络信息
+========================================
+
+IntHeader 是放在数据包中的网络状态附加头。不同拥塞控制算法需要不同信息。
+
+SetupNetwork 会把多种算法的参数同时写入 RdmaHw，但 CC_MODE 只选择一条运行分支。参数已经存在不等于当前实验会读取它。
+
+1. CC_MODE=1：DCQCN，IntHeader::NONE
+
+   当前配置。交换机使用 ECN 标记，接收端返回 CNP，发送端据此降低速率。数据包不携带完整逐跳网络状态。
+
+2. CC_MODE=3：HPCC，IntHeader::NORMAL
+
+   每经过一台交换机，都向 IntHeader 加入一个 IntHop。IntHop 记录该跳的时间、累计发送字节数、队列长度和链路速率。接收端把这些信息随 ACK 返回，发送端估算每一跳的利用率并调整速度。
+
+   MultiRate 决定是否为每一跳分别维护速率状态；FastReact 决定完整一轮反馈到齐前是否用新 ACK 先调整实际速率；SampleFeedback 只在快速反应时决定是否忽略没有明显排队的跳，它不是随机丢弃 ACK。
+
+3. CC_MODE=7：TIMELY，IntHeader::TS
+
+   数据包主要携带时间戳。发送端根据“发出数据到收到确认”的 RTT 变化判断排队是否加重，并调节速率。RTT 是数据发出后到收到反馈的往返时间。
+
+4. CC_MODE=8：DCTCP，IntHeader::NONE
+
+   主要使用 ECN 标记比例调节发送速度，不需要完整逐跳信息。
+
+   DctcpRateAI 最终保存到 m_dctcp_rai。只有 DCTCP 完成一批反馈、当前没有处于拥塞降速状态时，才执行：
+
+   新速率 = min(最大速率, 当前速率 + m_dctcp_rai)
+
+   默认 1000Mb/s 表示每次增加 1Gb/s，不表示 QP 当前速率固定为 1Gb/s。
+
+5. CC_MODE=10：HPCC-PINT，IntHeader::PINT
+
+   把路径拥塞程度压缩成约 1～2 字节的信息，减少完整 HPCC 逐跳头部的开销，但信息精度也更低。
+
+   PINT_LOG_BASE 决定压缩编码的范围和精度；SetPintSmplThresh(PINT_PROB) 把 0～1 的概率转换成 0～65536 门限。发送端处理 ACK 时生成随机数，只有通过门限的 ACK 才用于 PINT 速率更新。PINT_PROB=1.0 表示全部相关 ACK 都参与，不代表数据包只以某种概率在网络中传输。
+
+IntHop::multi
+    IntHop 中字节数和队列长度字段位数有限，因此先按单位缩小后存储。当前 INT_MULTI=1 时，字节计数按 128 字节单位编码，队列长度按 80 字节单位编码。multi 越大，可表示范围越大，但精度越低。它主要对 HPCC 完整逐跳信息有意义。
+
+GPUsPerServer 不是拥塞控制参数，但与这些算法使用同一个 RdmaHw。它保存到 m_gpus_per_server，在处理 QP 时决定选 NVSwitch 端口还是普通网络端口；拥塞控制随后控制的是已经选定端口上的 QP 发送节奏。
+
+
+十一、目标 GPU 收到数据以后发生什么
+====================================
+
+目标 GPU 不是仅靠 Node 自己处理 RDMA 数据。RdmaDriver::Init() 已经调用 RdmaHw::Setup()，把节点现有的 QbbNetDevice 与 RdmaHw 接通。
+
+对每个真实 QbbNetDevice，Setup 已经登记：
+
+m_rdmaReceiveCb → RdmaHw::Receive
+    网卡收到 RDMA 相关报文时进入 RdmaHw。
+
+m_rdmaSentCb → RdmaHw::SendPacketComplete
+    项目识别到最后一部分数据完成源端口发送时上报。
+
+m_rdmaLinkDownCb → RdmaHw::SetLinkDown
+    端口链路失效时通知 RdmaHw。
+
+m_rdmaPktSent → RdmaHw::PktSent
+    每发送一个包后更新 QP 发送状态。
+
+m_rdmaUpdateTxBytes → RdmaHw::UpdateTxBytes
+    同步端口累计发送字节数。
+
+m_rdmaGetNxtPkt → RdmaHw::GetNxtPacket
+    RdmaEgressQueue 选中 QP 后，向 RdmaHw 请求生成下一个包。
+
+这说明收发路径不是“Node 调用一个大函数完成所有事情”，而是网卡、端口调度器和 RdmaHw 通过回调分工协作。
+
+目标 GPU 的 QbbNetDevice 收到数据包后，会根据数据包类型处理：
+
+PFC 报文
+    修改对应优先级的暂停或恢复状态。
+
+普通数据包
+    如果当前节点是交换机，继续查表转发；如果是 GPU 网络端点，交给 RDMA 接收逻辑。
+
+ACK/NACK/CNP
+    交给源端的 RDMA/QP 状态，用来确认数据、处理丢失或调整速率。
+
+RDMA 接收端会记录下一段期望收到的数据位置。如果已经满足确认条件，就生成 ACK；如果发现序号缺失，可以生成 NACK。
+
+ACK 返回源端后，源端 QbbNetDevice 再通过 m_rdmaReceiveCb 把它交给源 RdmaHw。RdmaHw 根据 ACK 中的地址、端口和优先级找到发送 QP，更新已确认位置。
+
+如果 qp->IsFinished() 成立，完成链是：
+
+RdmaHw::QpComplete(qp)
+    ↓
+RdmaDriver::QpComplete(qp)
+    ↓
+RdmaDriver 的 QpComplete TraceSource
+    ↓
+qp_finish(fct_output, q)
+
+RdmaHw::QpComplete 还会取消当前 QP 的 DCQCN 定时事件、执行上层完成通知，并从发送端 QP 表中删除该 QP。
+
+qp_finish 会汇总属于同一上层 flow 的接收数据，并在满足上层通信完成条件后通知 Astra-Sim。集合通信通常包含多条相互依赖的点到点流，单个 QP 完成不一定等于整个 AllReduce 或 AllToAll 完成。
+
+截至 SetupNetwork() 结束，已经完成的是这些回调的安装，并通过相关函数提前确认了完成链的连接关系；真实数据包怎样进入 Receive、ACK 怎样构造以及 QP 怎样更新序号，仍要在后续逐包路线中继续深入。
+
+
+十二、网络耗时到底是怎样形成的
+================================
+
+Simulation 路线中的网络耗时不是从配置文件直接传入一个最终答案，也不是只用“通信量÷总线带宽”得到。
+
+配置文件和拓扑文件提供的是网络条件：
+
+通信量和集合通信类型
+单个数据包大小
+每条链路的带宽
+每条链路的传播延迟
+交换机连接方式
+交换机缓存大小
+ECN/PFC 阈值
+拥塞控制算法和参数
+链路错误率
+
+NS-3 再根据这些条件逐个安排事件：
+
+某个时刻数据包开始发送
+    ↓
+经过序列化时间后发送完成
+    ↓
+经过链路传播延迟后到达下一节点
+    ↓
+在交换机排队并等待出口
+    ↓
+可能产生 ECN、CNP 或 PFC
+    ↓
+发送速率或暂停状态发生改变
+    ↓
+最终到达目标并返回确认
+
+因此最终网络通信时间包含：
+
+数据包序列化时间
+链路传播时间
+每一跳交换机排队时间
+并发流竞争产生的等待
+拥塞控制降低速率产生的额外时间
+PFC 暂停时间
+必要的确认、反馈或恢复时间
+
+当前代码同时登记 SendComplete 和 QpComplete，但它们不是同一个完成边界。
+
+1. SendComplete：数据已经离开发送端网卡
+
+   QbbNetDevice::TransmitStart() 计算当前包的发送序列化时间 txTime。项目使用：
+
+   p->GetSize() < 9000 且 p->GetSize() > 60
+
+   作为“最后一个非满数据包且不是小 ACK”的启发式条件，并在 txTime 后安排 SendCallback。随后事件经过：
+
+   QbbNetDevice::SendCallback
+       → RdmaHw::SendPacketComplete
+       → RdmaDriver::SendComplete
+       → SendComplete TraceSource
+       → send_finish(send_output, q)
+
+   send_finish 汇总同一上层 flow 已经从源端网卡送出的数据量。它表示最后一部分数据完成源端口序列化，但数据可能仍在链路上传播或在交换机排队。
+
+   这个包大小判断依赖当前 MTU/包头配置，不是通用 RDMA 完成判定。如果最后一包恰好为满包或修改 PACKET_PAYLOAD_SIZE，需要重新检查该条件是否仍能正确触发。
+
+2. QpComplete：数据已经被确认
+
+   源端收到 ACK 并确认 QP 全部数据后才触发 QpComplete。qp_finish 记录：
+
+   实际FCT = Simulator::Now() - q->startTime
+
+   因此它包含从 QP 开始到最终确认返回之间实际经历的离散事件时间。
+
+3. standalone_fct：无竞争基线
+
+   qp_finish 还计算：
+
+   standalone_fct = base_rtt + total_bytes × 8 ÷ 路径瓶颈带宽
+
+   其中 total_bytes 不只包含有效通信量 q->m_size，还加上按数据包数量产生的协议头字节。
+
+   standalone_fct 近似回答“如果没有其他流竞争、没有额外排队和暂停，这条流至少需要多久”。实际 FCT 比它多出的部分可能来自：
+
+   交换机排队
+   PFC 暂停
+   ECN/CNP 导致的降速
+   ACK/反馈等待
+   丢包与恢复
+
+4. 完成事件的典型先后关系
+
+   最后一个数据包开始从源端口发送
+       ↓ 经过该包序列化时间
+   SendComplete
+       ↓ 继续传播、排队并到达目标
+       ↓ ACK 返回源端
+   QpComplete
+       ↓ 多个 QP/阶段继续汇聚
+   上层集合通信完成
+
+因此，对一条 RDMA 流而言，QpComplete 对应的当前时间减开始时间更接近完整端到端 FCT；SendComplete 只表示发送端已经把数据交给网络。对一次集合通信而言，还要等待算法所要求的全部 QP 和阶段完成，才能得到上层通信操作的完成时间。
+
+5. 数据包追踪与周期监控
+
+   TRACE_FILE 是运行前准备的输入文件：第一个值是 trace_num，后面是需要观察的统一节点编号。程序用这些编号从 NodeContainer n 中选择 GPU、普通交换机或 NVSwitch，并组成 trace_nodes。它不是通信流量输入，也不描述一条路由。
+
+   TRACE_OUTPUT_FILE 是程序创建的二进制输出。QbbHelper::EnableTracing() 会在 trace_nodes 的每个 QbbNetDevice 上登记收包、入队、出队、丢包和 RDMA QP 取包回调。Simulator::Run() 之后，每发生一次对应事件就写一条 TraceFormat，记录时间、节点、端口、队列、队列长度、源目地址、协议类型、ECN 状态和报文相关字段。
+
+   在逐包记录之前，SimSetting 会先写入每个“节点—本地端口”的实际 bit/s 速度以及 maxBdp。端口速度最初来自拓扑文件，但这里从已经建立的 QbbNetDevice 对象查询并转换为统一数值，再作为追踪文件自描述元数据保存；这一步不会重新配置网络。当前 trace_reader 会读取这段文件头，但没有用它执行进一步性能计算，因此其当前作用主要是元数据和预留分析信息。
+
+   逐包追踪与 qlen、bw、QP rate、CNP 等周期监控不同：前者在每次包事件发生时记录，信息细但输出量大；后者按固定间隔采样，更适合观察长时间变化趋势。
+
+
+十三、已经遇到的参数总表
+==========================
+
+以下只整理目前已经出现过的参数。参数按照所在物理环节分类，而不是按照读取它们的函数分类。
+
+
+A. GPU、服务器和节点组成
+-------------------------
+
+node_num
+    拓扑中全部 NS-3 节点总数，包括 GPU、NVSwitch 和普通网络交换机。
+
+gpus_per_server
+    每台服务器中的 GPU 数量，用来判断服务器归属和组织服务器内部路径。
+
+nvswitch_num
+    拓扑中的 NVSwitch 节点数量。
+
+switch_num
+    普通数据中心网络交换机数量，不包含 NVSwitch。
+
+link_num
+    拓扑文件中链路记录的数量。
+
+gpu_type_str / gpu_type
+    拓扑文件中的 GPU 型号字符串及其转换后的 GPUType 枚举。
+
+sid
+    从拓扑文件读取的节点编号。读取 NVSwitch 编号时将对应 node_type 设为 2；读取普通交换机编号时设为 1。
+
+node_type[i]
+    建立拓扑阶段使用的临时节点类别表。
+
+m_node_type
+    节点对象内部长期保存的类别：0 为 GPU 网络端点，1 为普通交换机，2 为 NVSwitch。
+
+NVswitchs
+    保存全部 NVSwitch 节点编号。
+
+nvswitch_id
+    逻辑执行单元所对应的 NVSwitch 编号。
+
+num_gpus
+    参与 GPU 通信的 GPU 总数。
+
+
+B. 通信需求与启动输入
+---------------------
+
+workload
+    Workload 文件路径。文件描述计算、通信类型、通信量以及通信发生顺序。
+
+network_topo
+    物理网络拓扑文件路径。
+
+network_conf
+    网络设备、拥塞控制、缓存和监控配置文件路径。
+
+thread
+    运行 NS-3 多线程事件模拟器时最多使用的真实 CPU 线程数。它影响仿真在电脑上运行得多快，不代表 GPU 数，也不应直接改变被模拟的网络带宽和延迟。
+
+
+C. 数据包、链路和可靠传输
+-------------------------
+
+PACKET_PAYLOAD_SIZE=9000
+    单个网络数据包携带的有效数据规模。大块集合通信数据需要按它拆成多个包。
+
+L2_CHUNK_SIZE=4000
+    二层可靠传输使用的数据块大小；为 0 时关闭相应 chunk 模式。
+
+L2_ACK_INTERVAL=1
+    二层确认间隔。当前值 1 表示频繁产生确认；为 0 时关闭该确认机制。
+
+L2_BACK_TO_ZERO=0
+    收到确认或发生恢复时是否按“回到当前块起点”的方式处理序号。
+
+ERROR_RATE_PER_LINK=0.0000
+    没有在某条链路上单独指定错误率时使用的全局数据包错误概率。
+
+data_rate
+    某条链路的发送速率，例如 400Gbps。
+
+link_delay
+    某条链路的固定传播延迟，例如 0.0005ms。
+
+error_rate
+    拓扑文件对某条具体链路指定的数据包错误概率。
+
+RngSeed / RngRun
+    NS-3 伪随机系统的全局种子和重复运行编号。当前路线未显式修改时默认都为 1。
+
+stream=50
+    链路误包用 UniformRandomVariable 的随机数流编号，用于保持随机结果可重现，不是误包率或随机种子。
+
+serverAddress
+    GPU/NVSwitch 的稳定节点 IPv4 地址，格式为 11.x.x.1，主要用来标识通信的最终目标节点。
+
+ipstring
+    为当前物理链路临时生成的 10.A.B.0 子网地址字符串，不是节点稳定地址。
+
+nbr2if
+    项目自定义的直接邻居映射表。nbr2if[当前节点][邻居] 保存本地出口编号、链路状态、传播延迟和带宽。
+
+nextHop
+    按“当前节点—最终目的 GPU”保存所有最短跳数候选下一跳；SetRoutingEntries() 再把下一跳节点转换为本地设备编号。
+
+pairDelay / pairTxDelay / pairBw
+    保存一对 GPU 代表性最短路径的累计传播延迟、一个有效载荷数据块的累计序列化时间和路径瓶颈带宽。
+
+pairRtt / pairBdp
+    保存每对 GPU 的基础往返时间和对应在途数据量；当前不会为每条 ECMP 候选路径分别保存一套数值。
+
+maxRtt / maxBdp
+    分别保存所有 GPU 对基础 RTT 和 BDP 的最大值；当前所有 QP 使用它们作为统一基础时间与窗口参数，maxRtt 还供 HPCC-PINT 的交换机端口负载估计使用。
+
+m_rtTable / m_rtTable_nxthop_nvswitch
+    RdmaHw 按最终目的 IP 保存普通网络候选出口和 NVSwitch 候选出口；SwitchNode、NVSwitchNode 的 m_rtTable 则供收到数据包后的交换转发使用。
+
+nvswitch_set
+    add_nvswitch() 写入的直接下一跳目的编号集合；当前源码没有读取者，因此不影响端口选择、路由或通信时间。
+
+
+D. 普通交换机缓存、PFC 与 ECN
+--------------------------------
+
+ENABLE_QCN=1
+    启用项目中的拥塞反馈相关行为，并让普通交换机允许设置 ECN 标记。
+
+USE_DYNAMIC_PFC_THRESHOLD=1
+    配置是否使用动态 PFC 阈值。
+
+PAUSE_TIME
+    PFC 暂停报文携带的暂停时间，未在当前 SimAI.conf 中显式配置时使用代码默认值 5 微秒。
+
+BUFFER_SIZE=32
+    交换机总缓存大小，后续按 32 MiB 配置到 SwitchMmu。
+
+nic_rate
+    从第一个 GPU 节点的设备 1 读取的网卡带宽基准。它不改变任何链路速率，只用来判断交换机端口相对 GPU 网卡快多少。
+
+headroom
+    为 PFC pause 生效前仍会继续到达的在途数据预留的缓存。当前按端口带宽、单向传播延迟和系数 3 计算。
+
+pfc_a_shift
+    动态 PFC 阈值计算中的右移位数。数值越小，端口可以使用的剩余共享缓存比例越大。
+
+reserve
+    SwitchMmu 为每端口、每优先级保留的基础缓存，当前构造默认值为 4 KiB。
+
+resume_offset
+    PFC 恢复阈值相对暂停阈值预留的安全距离，当前构造默认值为 3 KiB，用来减少刚恢复后立即再次暂停的振荡。
+
+KMIN_MAP
+    按链路速率给出开始概率性 ECN 标记的队列阈值。
+
+KMAX_MAP
+    按链路速率给出进入最大 ECN 标记概率的队列阈值。
+
+PMAX_MAP
+    按链路速率给出最大 ECN 标记概率。
+
+ACK_HIGH_PRIO=0
+    是否让 ACK/NACK 使用高优先级队列。
+
+RdmaEgressQueue::ack_q_idx
+    ACK/NACK 实际进入的全局队列编号；ACK_HIGH_PRIO 非零时为 0，否则为 3。
+
+
+E. 拥塞控制与发送速率调节
+-------------------------
+
+CC_MODE=1
+    选择拥塞控制方式。当前选择 Mellanox 风格 DCQCN。
+
+MIN_RATE=100Mb/s
+    一条被限速的 RDMA 流允许降低到的最小发送速率。
+
+RATE_AI=50Mb/s
+    拥塞缓解后，普通加性增速阶段每次提高的速率单位。
+
+RATE_HAI=100Mb/s
+    更积极的加性增速阶段使用的速率单位。
+
+RATE_DECREASE_INTERVAL=4
+    检查或执行降低发送速率的时间间隔参数。
+
+ALPHA_RESUME_INTERVAL=1
+    DCQCN 中恢复/更新拥塞程度参数 alpha 的间隔。
+
+RP_TIMER=900
+    发送端恢复速率时使用的定时参数，代码属性说明使用微秒。
+
+EWMA_GAIN=0.00390625
+    对拥塞反馈进行指数加权平均时的新反馈权重；影响发送端对拥塞变化的敏感程度。
+
+FAST_RECOVERY_TIMES=1
+    速率恢复状态切换使用的次数阈值。
+
+CLAMP_TARGET_RATE=0
+    收到拥塞反馈时是否立即限制目标发送速率。
+
+HAS_WIN=1
+    是否使用在途数据窗口相关控制。
+
+VAR_WIN=1
+    是否让在途窗口随当前发送速率等状态变化。
+
+FAST_REACT=1
+    是否对新的拥塞反馈快速反应。
+
+U_TARGET=0.95
+    HPCC 等算法希望瓶颈链路维持的目标利用率，当前为 95%。
+
+MI_THRESH=0
+    连续加性增长多少次后进入更积极增长阶段的阈值。
+
+RATE_BOUND=1
+    是否真正使用计算出的速率限制数据包发送时间。
+
+DCTCP_RATE_AI=1000Mb/s
+    DCTCP 模式恢复发送速率时使用的增加单位。
+
+MULTI_RATE=0
+    HPCC 是否为路径中的不同跳分别维护发送速率状态。
+
+SAMPLE_FEEDBACK=0
+    HPCC 快速反应时是否忽略没有明显排队的跳，只使用更有代表性的交换机反馈；它不是 PINT 的随机 ACK 采样概率。
+
+PINT_LOG_BASE=1.05
+    PINT 压缩编码使用的对数底数。
+
+PINT_PROB=1.0
+    HPCC-PINT 发送端处理 ACK 拥塞反馈的采样概率，1.0 表示每个相关 ACK 都用于速率更新。
+
+INT_MULTI=1
+    HPCC 完整逐跳信息中，字节数和队列长度的编码缩放系数。
+
+GLOBAL_T
+    选择 QP 使用全局最大 BDP/RTT，还是使用源目节点对专属 BDP/RTT 的开关。当前 ReadConf 会把它强制设为 1，因此固定使用全局最大值。
+
+NIC_TOTAL_PAUSE_TIME
+    预备用于模拟 PCIe 侧导致的额外 PFC 暂停次数。当前只保存到 m_total_pause_times，没有运行代码读取，因此目前不会影响网络结果。
+
+
+F. RDMA 接口组织与完成事件
+--------------------------
+
+RdmaHw::m_nic
+    保存当前端节点全部 RdmaInterfaceMgr 的数组。索引与 Node 的设备编号对齐，非 Qbb 设备对应的 dev 可以为空。
+
+RdmaInterfaceMgr::dev
+    当前 RDMA 接口记录对应的 QbbNetDevice，负责端口排队、序列化和链路收发。
+
+RdmaInterfaceMgr::qpGrp
+    分配给该端口的 QP 集合。它与 QbbNetDevice 的 RdmaEgressQueue 共享同一个对象。
+
+RdmaQueuePairGroup::m_qps
+    使用同一个端口发送的 QP 智能指针数组。网卡从中选择当前可以继续发送的流。
+
+tx_bytes / last_tx_bytes
+    RdmaHw 按端口保存的累计发送字节数和上次监控值，用于计算端口带宽利用率。
+
+fct_output
+    QpComplete 回调使用的流完成时间文件句柄。
+
+send_output
+    SendComplete 回调使用的发送完成文件句柄；默认文件名来自 send_output_file="send.txt"。
+
+QpComplete
+    QP 的全部数据已经被确认后发出的 TraceSource，连接 qp_finish，并作为端到端 FCT 的完成边界。
+
+SendComplete
+    项目判断最后一部分数据已完成源网卡序列化时发出的 TraceSource，连接 send_finish；它早于端到端确认完成。
+
+
+G. 链路故障、模拟停止与记录
+---------------------------
+
+LINK_DOWN 0 0 0
+    由链路失效时间、链路端点 A、链路端点 B 三个值组成。当前全为 0，不安排有效链路故障。
+
+SIMULATOR_STOP_TIME=40000000000000.00
+    配置会把它读入 simulator_stop_time，但当前版本没有使用该变量安排停止事件。AstraSimNetwork.cc 反而在 Simulator::Run() 返回后才调用固定的 Simulator::Stop(Seconds(2000000000))，因此修改这个配置值不会改变本次模拟何时结束。
+
+ENABLE_TRACE=1
+    是否启用指定节点的网络 trace 记录。
+
+TRACE_FILE
+    指定需要记录 trace 的节点列表文件。
+
+TRACE_OUTPUT_FILE
+    trace 输出文件路径。
+
+FCT_OUTPUT_FILE
+    流完成时间输出文件。FCT 表示一条流从开始到完成所需的时间。
+
+send_output_file
+    发送完成事件的输出文件路径，当前代码默认使用 send.txt，并未从 ReadConf 的配置键覆盖。
+
+PFC_OUTPUT_FILE
+    PFC 暂停/恢复事件输出文件。
+
+QLEN_MON_FILE
+    交换机队列长度监控输出文件。
+
+BW_MON_FILE
+    端口带宽使用情况监控输出文件。
+
+RATE_MON_FILE
+    RDMA QP 发送速率监控输出文件。
+
+CNP_MON_FILE
+    CNP 拥塞通知数量监控输出文件。
+
+MON_START / MON_END
+    MON_START 决定四类周期监控第一次执行的模拟时间。MON_END 虽然会被读取，但当前监控函数不检查它并会持续自我调度，因此它目前不能真正终止监控。
+
+QP_MON_INTERVAL=100
+    QP 速率等状态的采样间隔。
+
+QLEN_MON_INTERVAL=10000
+    交换机队列长度的采样间隔。
+
+BW_MON_INTERVAL=10000
+    端口带宽统计的采样间隔。
+
+FLOW_FILE
+    底层网络程序保留的流输入文件参数。当前 GPU 集合通信需求主要来自 workload。
+
+flow_num
+    FLOW_FILE 文件头读取出的流数量。
+
+trace_num
+    TRACE_FILE 中需要设置 trace 的节点数量。
+
+trace_nodes
+    根据 TRACE_FILE 节点编号选出的 NodeContainer；只有其中节点的 QbbNetDevice 会登记逐包追踪回调。
+
+trace_output
+    TRACE_OUTPUT_FILE 打开后得到的文件句柄；先写 SimSetting 文件头，再在运行阶段追加逐数据包事件。
+
+SimSetting::port_speed
+    按“节点编号—本地端口编号”保存从 QbbNetDevice 查询到的当前 bit/s 速度，作为追踪文件自描述元数据，不改变端口速率。
+
+SimSetting::win
+    写入追踪文件头的 maxBdp 副本，供离线分析了解全局窗口；该赋值本身不设置 QP 窗口。
+
+portNumber
+    按“源节点—目的节点”保存下一条 QP 要使用的源通信端口号，初始值为 10000；它用于区分同一节点对的多条 QP，不是物理网卡接口编号。
+
+interPacketInterval
+    SetupNetwork 中计算出的 250 纳秒时间变量；当前源码没有读取者，因此不影响真实数据包发送间隔。
+
+flow_input.idx
+    旧 FlowInput 状态中的序号字段，初始化为无符号整数的 -1 并在 SendFlow() 中递增；当前没有代码读取递增结果，因此不影响网络行为。
+
+link_down_time / link_down_A / link_down_B
+    LINK_DOWN 拆出的故障延迟和链路两端统一节点编号；时间大于 0 时，在模拟开始 2 秒后再等待指定微秒数调用 TakeDownLink()。
+
+
+十四、目前最应该记住的主线
+============================
+
+如果暂时记不住全部参数，先牢牢记住下面这条链：
+
+训练并行策略产生通信需求
+    ↓
+集合通信算法把需求拆成 GPU 之间的点到点流
+    ↓
+每条流由 QP 保存发送量、确认位置、窗口和当前速率
+    ↓
+GPU 在 NS-3 中是 Node，网卡/端口是 QbbNetDevice
+    ↓
+同服务器数据可经过 NVSwitchNode
+    ↓
+跨服务器数据经过 QbbChannel 和 SwitchNode
+    ↓
+SwitchMmu 记录缓存占用并决定 ECN/PFC
+    ↓
+ECN/CNP 降低 QP 发送速率，PFC 暂停某类队列
+    ↓
+NS-3 逐个推进发包、传播、排队、转发和确认事件
+    ↓
+最后一条必要数据流完成时，得到集合通信网络耗时
+
+
+十五、当前学习边界
+==================
+
+已经整理到的代码阶段：
+
+SetupNetwork 已经完成以下网络初始化工作：
+
+1. 读取拓扑总体信息，区分 GPU、普通交换机和 NVSwitch，并创建对应的 NS-3 Node。
+2. 给节点安装网络协议对象，准备 GPU/NVSwitch 的 serverAddress。
+3. 逐条读取 src、dst、data_rate、link_delay 和 error_rate。
+4. 为每条链路创建两个 QbbNetDevice 和一个 QbbChannel，并设置带宽、传播延迟和误包模型。
+5. 把 QbbNetDevice 登记为 IPv4 接口，配置 11.x.x.1 稳定节点地址和每链路 10.A.B.0/24 接口地址。
+6. 在 nbr2if 中按两个方向保存邻居、本地出口、链路状态、传播延迟和带宽。
+7. 为链路两端注册 PFC 暂停/恢复事件日志回调。
+8. 按普通交换机每个端口的速率配置 KMIN、KMAX 和 PMAX，并为端口计算 headroom。
+9. 根据交换机端口速率与 GPU 网卡基准速率的关系配置动态 PFC 共享缓存比例。
+10. 为普通交换机和 NVSwitch 配置真实端口数、总缓存和 MMU 节点编号。
+11. 为 GPU/NPU 端节点创建 RdmaHw，写入可靠传输、发送速率和拥塞控制参数。
+12. 创建 RdmaDriver，并把 Node、RdmaDriver 和 RdmaHw 关联起来。
+13. 为节点上的设备建立 RdmaInterfaceMgr 和 RdmaQueuePairGroup。
+14. 把 QP 集合、收发处理、链路故障和带宽统计回调连接到 QbbNetDevice。
+15. 登记 SendComplete 和 QpComplete 事件，分别连接发送完成与流完成处理函数。
+16. 根据 ACK_HIGH_PRIO 把 ACK/NACK 的发送队列统一设置为最高优先级 0 或普通优先级 3。
+17. 以每个 GPU 为最终目的节点，通过 nbr2if 反向计算最短跳数、累计传播延迟、累计序列化时间、瓶颈带宽和候选下一跳。
+18. 把候选下一跳转换为本地设备编号，分别安装进普通 SwitchNode、NVSwitchNode 和 GPU/NVSwitch 所关联的 RdmaHw 路由表。
+19. 为所有源 GPU—目的 GPU 组合计算 pairRtt、pairBdp，并取得 maxRtt、maxBdp。
+20. 把 cc_mode 和 maxRtt 写入普通交换机，为后续 HPCC/HPCC-PINT 逐跳反馈准备运行参数。
+21. 从 TRACE_FILE 选择追踪节点，并为这些节点的 QbbNetDevice 登记逐包事件回调。
+22. 把实际端口速度和 maxBdp 作为 SimSetting 文件头写入 TRACE_OUTPUT_FILE。
+23. 为 GPU/NVSwitch 节点对初始化从 10000 开始的 QP 源通信端口号；确认 interPacketInterval 和 flow_input.idx 在当前版本中没有有效读取者。
+24. 关闭已读完的拓扑与追踪输入文件，并在 LINK_DOWN 启用时预约未来的链路故障事件。
+
+当前准确停在 common.h 第 1037 行，SetupNetwork() 已完整结束。
+
+下一段从 AstraSimNetwork.cc 中的 systems[i]->workload->fire() 及其后续调用开始，沿“工作负载提出集合通信—SimCCL 拆分点到点 Flow—SendFlow() 创建 RdmaClientHelper—RdmaDriver/RdmaHw 建立 QP”的边界继续追踪。
+
+目前已经完成网络运行前的物理拓扑、设备、缓存、RDMA 端侧组织、静态路由、基础 RTT/BDP、追踪和故障事件准备。真实 QP 创建、分包、逐跳转发、运行时排队、PFC/ECN/DCQCN 闭环和 ACK 返回仍未沿一条实际数据流完整追踪。

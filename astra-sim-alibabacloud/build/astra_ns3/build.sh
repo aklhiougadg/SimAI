@@ -67,7 +67,7 @@ function compile {
     cd "${NS3_DIR}/simulation"
     CC='gcc' CXX='g++' 
     ./ns3 configure -d debug --enable-mtp
-    ./ns3 build
+    ./ns3 build -j 4
 
     cd "${SCRIPT_DIR:?}"
 }

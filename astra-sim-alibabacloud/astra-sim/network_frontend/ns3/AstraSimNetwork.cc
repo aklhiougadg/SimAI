@@ -211,10 +211,10 @@ sim_recv_end_section:
 };
 
 struct user_param {
-  int thread;
+  int thread;                // 使用的仿真线程数
   string workload;
-  string network_topo;
-  string network_conf;
+  string network_topo;       // 物理网络拓扑文件
+  string network_conf;       // 网络行为配置文件
   user_param() {
     thread = 1;
     workload = "";
