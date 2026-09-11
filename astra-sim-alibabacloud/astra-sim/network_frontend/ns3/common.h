@@ -96,6 +96,7 @@ uint32_t qp_mon_interval = 100;
 uint32_t bw_mon_interval = 10000; 
 uint32_t qlen_mon_interval = 10000; 
 uint64_t mon_start = 0, mon_end = 2100000000;
+bool enable_monitor = false;
 
 string qlen_mon_file;
 string bw_mon_file;
@@ -178,7 +179,9 @@ void monitor_qlen(FILE* qlen_output, NodeContainer *n){
 			sw->PrintSwitchQlen(qlen_output);
 		}
 	}
-	Simulator::Schedule(MicroSeconds(qlen_mon_interval), &monitor_qlen, qlen_output, n);
+	if (Simulator::Now() + MicroSeconds(qlen_mon_interval) <= MicroSeconds(mon_end)) {
+		Simulator::Schedule(MicroSeconds(qlen_mon_interval), &monitor_qlen, qlen_output, n);
+	}
 }
 void monitor_bw(FILE* bw_output, NodeContainer *n){
 	for (uint32_t i = 0; i < n->GetN(); i++){
@@ -193,7 +196,9 @@ void monitor_bw(FILE* bw_output, NodeContainer *n){
 			host->GetObject<RdmaDriver>()->m_rdma->PrintHostBW(bw_output, bw_mon_interval);
 		}
 	}
-	Simulator::Schedule(MicroSeconds(bw_mon_interval), &monitor_bw, bw_output, n);
+	if (Simulator::Now() + MicroSeconds(bw_mon_interval) <= MicroSeconds(mon_end)) {
+		Simulator::Schedule(MicroSeconds(bw_mon_interval), &monitor_bw, bw_output, n);
+	}
 }
 void monitor_qp_rate(FILE* rate_output, NodeContainer *n){
 	for(uint32_t i = 0; i < n->GetN(); i++){
@@ -202,7 +207,9 @@ void monitor_qp_rate(FILE* rate_output, NodeContainer *n){
 			host->GetObject<RdmaDriver>()->m_rdma->PrintQPRate(rate_output);
 		}
 	}
-	Simulator::Schedule(MicroSeconds(qp_mon_interval), &monitor_qp_rate, rate_output, n);
+	if (Simulator::Now() + MicroSeconds(qp_mon_interval) <= MicroSeconds(mon_end)) {
+		Simulator::Schedule(MicroSeconds(qp_mon_interval), &monitor_qp_rate, rate_output, n);
+	}
 }
 void monitor_qp_cnp_number(FILE* cnp_output, NodeContainer *n){
 	for(uint32_t i = 0; i < n->GetN(); i++){
@@ -211,9 +218,15 @@ void monitor_qp_cnp_number(FILE* cnp_output, NodeContainer *n){
 			host->GetObject<RdmaDriver>()->m_rdma->PrintQPCnpNumber(cnp_output);
 		}
 	}
-	Simulator::Schedule(MicroSeconds(qp_mon_interval), &monitor_qp_cnp_number, cnp_output, n);
+	if (Simulator::Now() + MicroSeconds(qp_mon_interval) <= MicroSeconds(mon_end)) {
+		Simulator::Schedule(MicroSeconds(qp_mon_interval), &monitor_qp_cnp_number, cnp_output, n);
+	}
 }
 void schedule_monitor(){
+	if (mon_start > mon_end) {
+		std::cerr << "MON_START must not be greater than MON_END" << std::endl;
+		return;
+	}
 	FILE* qlen_output = fopen(qlen_mon_file.c_str(), "w"); 
 	assert(qlen_output != nullptr);
 	fprintf(qlen_output, "%s, %s, %s, %s, %s, %s\n", "time", "sw_id", "port_id", "q_id", "q_len", "port_len");
@@ -447,8 +460,11 @@ void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
 
 string get_output_file_name(string config_file, string output_file){
 	auto idx = config_file.find_last_of('/');
-	string ans = output_file.substr(0, output_file.length()-4) + config_file.substr(idx+7);
-	return ans;
+	string config_name = config_file.substr(idx == string::npos ? 0 : idx + 1);
+	if (config_name.rfind("config", 0) != 0 || output_file.length() < 4) {
+		return output_file;
+	}
+	return output_file.substr(0, output_file.length()-4) + config_name.substr(6);
 }
 
 uint64_t get_nic_rate(NodeContainer &n) {
@@ -626,6 +642,10 @@ bool ReadConf(string network_topo,string network_conf) {
         }
       } else if (key.compare("BUFFER_SIZE") == 0) {
         conf >> buffer_size;
+			}else if (key.compare("ENABLE_MONITOR") == 0){
+				uint32_t v;
+				conf >> v;
+				enable_monitor = (v != 0);
       } else if (key.compare("QLEN_MON_FILE") == 0){
 				conf >> qlen_mon_file;
 				qlen_mon_file = get_output_file_name(network_conf, qlen_mon_file);

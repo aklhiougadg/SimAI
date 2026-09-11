@@ -419,6 +419,9 @@ int main1(string network_topo,string network_conf) {
     return -1;
   SetConfig();
   SetupNetwork(qp_finish,send_finish);
+	if (enable_monitor) {
+		schedule_monitor();
+	}
 
 std::cout << "Running Simulation.\n";
   fflush(stdout);
