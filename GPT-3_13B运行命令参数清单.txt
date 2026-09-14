@@ -1,0 +1,76 @@
+参数名（GPT-3 13B值）           含义和用途                    来源                    对网络通信的影响
+------------------------------  ----------------------------  ----------------------  ----------------------------------------------------------
+--gpu_type H100                 GPU 类型。                    所有模型统一的实验设定  【固定】不直接改变通信数据量，统一设置。
+--model_name GPT_13B            工作负载的模型名称。          AICB官方参数表          【随模型变动】只用于区分模型，不直接影响通信。
+--frame Megatron                使用的训练框架。              AICB官方参数表          【固定】框架会改变通信方式，固定后便于公平比较。
+--world_size 128                参与训练的 GPU 总数。         论文明确给出            【固定】会显著影响通信规模，固定为128以便公平比较。
+--tensor_model_parallel_size 2  共同计算同一层的 GPU 数量。   AICB官方参数表          【随模型变动】决定TP通信组大小及是否跨服务器。
+--pipeline_model_parallel 1     模型划分的流水线阶段数。      AICB官方参数表          【随模型变动】决定是否产生阶段间点对点通信。
+--global_batch 128              每轮参数更新处理的总样本数。  AICB官方脚本            【随模型变动】根据DP推导，保持各模型GA=2。
+--micro_batch 1                 每个DP副本单次处理的样本数。  AICB官方脚本            【固定】会影响激活值大小，固定为1以减少额外变量。
+--num_layers 40                 Transformer 层数。            AICB官方参数表          【随模型变动】层数越多，通信事件重复次数越多。
+--num_attention_heads 40        每层的注意力头数。            AICB官方脚本            【随模型变动】随模型结构变化；hidden_size固定时影响较小。
+--hidden_size 5120              隐藏向量宽度。                AICB官方参数表          【随模型变动】越大，激活值和梯度通信量越大。
+--ffn_hidden_size 20480         前馈网络的中间维度。          AICB官方参数表          【随模型变动】越大，参数梯度通信量越大。
+--seq_length 2048               每个样本包含的 token 数。     AICB官方参数表          【随模型变动】越长，TP/SP单次通信量越大。
+--vocab_size 50257              词表大小。                    AICB官方脚本            【随模型变动】影响嵌入层的参数梯度通信量。
+--max_position_embeddings 4096  位置嵌入表的最大长度。        AICB官方脚本            【随模型变动】小幅影响位置嵌入梯度通信量。
+--dtype bfloat16                张量的数据类型。              所有模型统一的实验设定  【固定】直接决定每个元素的字节数，固定后才能公平比较。
+--epoch_num 1                   生成的训练轮数。              所有模型统一的实验设定  【固定】只模拟1轮，避免重复轮数影响总流量。
+--enable_sequence_parallel      启用序列并行。                AICB官方参数表          【随模型变动】决定是否产生相应的AllGather和ReduceScatter。
+--use-distributed-optimizer     启用分布式优化器。            AICB官方脚本            【固定】会改变DP通信类型，Megatron模型统一启用。
+
+
+网络拓扑参数
+------------
+
+参数名（第一次实验值）  含义和用途                  来源                    对网络通信的影响
+----------------------  --------------------------  ----------------------  --------------------------------------------
+-topo Spectrum-X        网络拓扑结构。              AICB官方参数表          【固定】决定GPU和交换机的连接方式。
+-g 128                  拓扑中的GPU总数。           论文明确给出            【固定】必须与工作负载的world_size一致。
+-gps 8                  每台服务器的GPU数量。       论文明确给出            【固定】决定服务器数量及通信是否跨服务器。
+-gt H100                拓扑采用的GPU类型。         所有模型统一的实验设定  【固定】统一硬件环境，本身不直接改变通信量。
+-bw 400Gbps             网卡到ASW的链路带宽。       AICB官方参数表          【固定】直接影响跨服务器Flow传输时间。
+-apbw 400Gbps           ASW到PSW的链路带宽。        AICB官方参数表          【固定】多条Flow汇聚时可能成为瓶颈。
+-nvbw 2880Gbps          GPU到NVSwitch的带宽。       AICB官方参数表          【固定】影响服务器内部GPU通信时间。
+-nsps 1                 每台服务器的NVSwitch数量。  AICB官方参数表          【固定】决定服务器内GPU连接结构。
+-nl 0.000025ms          GPU到NVSwitch的传播延迟。   AICB官方参数表          【固定】每跳增加25ns服务器内传输延迟。
+-l 0.0005ms             网卡链路的传播延迟。        AICB官方参数表          【固定】每跳增加500ns跨服务器传输延迟。
+-er 0                   每条链路的错误率。          AICB官方参数表          【固定】不注入随机链路错误和重传。
+
+
+第一次实验参数
+--------------
+
+实验目标                      GPT-3 13B 单轮网络通信仿真
+gpu_type                     H100
+model_name                   GPT_13B
+frame                        Megatron
+world_size                   128
+tensor_model_parallel_size   2
+pipeline_model_parallel      1
+DP                           64（由 128 ÷ 2 ÷ 1 得到）
+GA                           2
+global_batch                 128（由 64 × 1 × 2 得到）
+micro_batch                  1
+num_layers                   40
+num_attention_heads          40
+hidden_size                  5120
+ffn_hidden_size              20480
+seq_length                   2048
+vocab_size                   50257
+max_position_embeddings      4096
+dtype                        bfloat16
+epoch_num                    1
+enable_sequence_parallel     开启
+use-distributed-optimizer    开启
+AIOB                         关闭，使用AICB默认计算占位时间
+topology                     Spectrum-X
+gpus_per_server              8
+nv_switch_per_server         1
+nic_to_ASW_bandwidth         400Gbps
+ASW_to_PSW_bandwidth         400Gbps
+NVLink_bandwidth             2880Gbps
+NVLink_latency               0.000025ms（25ns）
+NIC_link_latency             0.0005ms（500ns）
+link_error_rate              0
