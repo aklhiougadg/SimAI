@@ -1,0 +1,180 @@
+SimAI代码上传与实验室电脑复现实验步骤
+========================================
+
+一、在当前电脑上传最新进度
+--------------------------
+
+以下命令在VSCode的WSL终端中执行：
+
+cd ~/SimAI
+git branch --show-current
+git status --short
+
+当前分支应当是：
+
+monitor-code-changes
+
+确认后提交全部当前进度：
+
+git add -A
+git status --short
+git commit -m "保存GPT-13B workload和实验进度"
+git push origin monitor-code-changes
+
+如果WSL因为代理问题无法连接GitHub，就只在WSL中完成commit，然后在Windows PowerShell中执行：
+
+cd "\\wsl.localhost\Ubuntu\home\wjy\SimAI"
+git push origin monitor-code-changes
+
+最后检查本地与远程分支状态：
+
+git status -sb
+
+
+二、实验室电脑准备WSL环境
+--------------------------
+
+以下命令在Windows PowerShell中执行。
+
+1. 检查WSL：
+
+wsl --version
+wsl -l -v
+
+建议使用WSL 2。如果还没有安装Ubuntu：
+
+wsl --install -d Ubuntu
+
+如果Ubuntu显示为WSL 1：
+
+wsl --set-default-version 2
+wsl --set-version Ubuntu 2
+
+更新WSL：
+
+wsl --update
+
+2. 启动Ubuntu后检查版本：
+
+lsb_release -a
+
+建议使用Ubuntu 24.04，与当前电脑保持一致。项目应放在Ubuntu内部的~/SimAI，不建议放在/mnt/c/目录下。
+
+
+三、安装基础编译环境
+--------------------
+
+以下命令在实验室电脑的Ubuntu/WSL终端中执行：
+
+sudo apt update
+sudo apt install -y git build-essential cmake python3 python3-venv
+
+检查版本：
+
+gcc --version
+g++ --version
+cmake --version
+python3 --version
+
+要求：GCC/G++支持C++17，CMake不低于3.14，Python不低于3.8。
+
+如果系统安装了ninja并导致SimAI的NS-3编译失败，再执行：
+
+sudo apt remove -y ninja-build
+
+
+四、从GitHub拉取完整代码
+------------------------
+
+cd ~
+git clone --branch monitor-code-changes --single-branch https://github.com/aklhiougadg/SimAI.git
+cd ~/SimAI
+
+检查分支：
+
+git branch --show-current
+git status -sb
+
+应当位于monitor-code-changes分支。
+
+本仓库已经把原来的子模块转换为完整源码，因此不要再执行git submodule update。
+
+
+五、编译SimAI-Simulation（NS-3模式）
+------------------------------------
+
+cd ~/SimAI
+./scripts/build.sh -c ns3
+
+首次编译通常需要数分钟。编译完成后检查：
+
+ls -l ~/SimAI/bin/SimAI_simulator
+
+如果该文件存在，说明SimAI的NS-3版本已经编译完成。NS-3仿真本身不需要GPU，主要使用CPU和内存。
+
+
+六、运行相同的GPT-13B实验
+-------------------------
+
+先进入实验目录：
+
+cd ~/SimAI/experiments/gpt13b_128g/run
+
+运行：
+
+set -o pipefail
+AS_SEND_LAT=3 AS_NVLS_ENABLE=1 ../../../bin/SimAI_simulator \
+  -t 8 \
+  -w ../workload_gpt13b.txt \
+  -n ../Spectrum-X_128g_8gps_400Gbps_H100 \
+  -c SimAI.conf 2>&1 | tee run_lab.log
+
+程序结束后立即检查退出状态：
+
+echo "simulator=${PIPESTATUS[0]}, tee=${PIPESTATUS[1]}"
+
+两个值都为0才表示程序和tee都正常结束。
+
+注意：该128 GPU workload通信量很大，运行时间可能较长。第一次验证新电脑环境时，可以先使用项目自带的小规模workload做冒烟测试，再运行正式实验。
+
+
+七、AICB虚拟环境（仅在重新生成workload时需要）
+------------------------------------------------
+
+如果只使用仓库中已经生成好的workload_gpt13b.txt进行NS-3仿真，可以跳过本节。
+
+如果需要在实验室电脑上重新生成workload：
+
+cd ~/SimAI/aicb
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+
+验证环境：
+
+python -c "import numpy, pandas; print('AICB dependencies OK')"
+
+退出虚拟环境：
+
+deactivate
+
+aicb/.venv/已被.gitignore排除，不会上传到GitHub。它不是源码，而且包含与当前电脑、Python版本和文件路径相关的内容，所以应在每台电脑上重新创建。
+
+
+八、两台电脑后续同步代码
+------------------------
+
+开始工作前拉取最新进度：
+
+cd ~/SimAI
+git switch monitor-code-changes
+git pull origin monitor-code-changes
+
+结束工作后上传：
+
+git add -A
+git status --short
+git commit -m "填写本次修改内容"
+git push origin monitor-code-changes
+
+不要让两台电脑同时修改并提交同一个文件。每次开始前先git pull，结束后及时git push，可以减少合并冲突。
