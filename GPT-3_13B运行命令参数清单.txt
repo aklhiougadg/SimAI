@@ -53,13 +53,13 @@ DP                           64（由 128 ÷ 2 ÷ 1 得到）
 GA                           2
 global_batch                 128（由 64 × 1 × 2 得到）
 micro_batch                  1
-num_layers                   40
-num_attention_heads          40
-hidden_size                  5120
-ffn_hidden_size              20480
-seq_length                   2048
-vocab_size                   50257
-max_position_embeddings      4096
+num_layers                   40     // 4
+num_attention_heads          40     // 8
+hidden_size                  5120   // 512
+ffn_hidden_size              20480  // 2048
+seq_length                   2048   // 256
+vocab_size                   50257  // 8192
+max_position_embeddings      4096   // 256
 dtype                        bfloat16
 epoch_num                    1
 enable_sequence_parallel     开启

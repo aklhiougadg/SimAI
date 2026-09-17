@@ -786,7 +786,7 @@ void RdmaHw::PrintQPRate(FILE* rate_output){
 		if(qp->m_rate.GetBitRate() == last_qp_rate[key]){
 			continue;
 		}
-		fprintf(rate_output, "%lu, %u, %u, %u, %u, %u, %u\n", Simulator::Now().GetTimeStep(), qp->m_src, qp->m_dest, qp->sport, qp->dport, qp->m_size, qp->m_rate.GetBitRate());
+		fprintf(rate_output, "%lu, %u, %u, %u, %u, %llu, %llu\n", Simulator::Now().GetTimeStep(), qp->m_src, qp->m_dest, qp->sport, qp->dport, static_cast<unsigned long long>(qp->m_size), static_cast<unsigned long long>(qp->m_rate.GetBitRate()));
 		fflush(rate_output);
 		last_qp_rate[key] = qp->m_rate.GetBitRate();
 	}
@@ -801,7 +801,7 @@ void RdmaHw::PrintQPCnpNumber(FILE* cnp_output){
 		Ptr<RdmaQueuePair> qp = it->second;
 		uint64_t key = it->first;
 		if(qp_cnp[key] != last_qp_cnp[key]){
-			fprintf(cnp_output, "%lu, %u, %u, %u, %u, %u, %u\n", Simulator::Now().GetTimeStep(), qp->m_src, qp->m_dest, qp->sport, qp->dport, qp->m_size, qp_cnp[key]);
+			fprintf(cnp_output, "%lu, %u, %u, %u, %u, %llu, %u\n", Simulator::Now().GetTimeStep(), qp->m_src, qp->m_dest, qp->sport, qp->dport, static_cast<unsigned long long>(qp->m_size), qp_cnp[key]);
 			fflush(cnp_output);
 			last_qp_cnp[key] = qp_cnp[key];
 		}
