@@ -1,0 +1,30 @@
+GPU类型：
+对于 TP 组的 AllReduce，A100/A800 走 Ring
+H100/H800 只有在 AS_NVLS_ENABLE=1、组内至少 8 个 rank、消息至少 2 MiB（默认阈值）时才选择 NVLS，否则也走 Ring。
+
+训练/通信框架：
+Megatron：TP、PP、DP、序列并行
+DeepSpeed：ZeRO 分片、参数/梯度 bucket 通信
+collective_test：不模拟完整模型，只测试 AllReduce 等操作
+DeepSeek：使用 DeepSeek 的 MLA、MoE/专家通信方式
+
+TP：
+同一层的参数和计算被切分到 n 张 GPU 上，这 n 张 GPU 之间需要 TP 通信（在每个微批次的前向计算和反向计算时）
+
+PP：
+把模型的不同层分为 n 个阶段，由不同的 GPU 组（根据TP划分的）负责
+
+DP：
+DP = world_size ÷ (TP × PP)
+表示有 n 个模型副本（参与同一轮训练的一份模型实例，不同副本的模型结构和参数保持一致，但每个副本处理不同数据）
+同时处理不同的数据批次（一次送入某一个模型副本处理的一组训练样本）
+DP同步：相同 TP / PP 位置的模型副本之间通信
+
+GA：
+一个 DP 模型副本连续处理多少个微批次后进行一次参数更新
+
+global_batch：
+全局训练批次大小，表示完成一次参数更新时，所有 DP 模型副本合计处理的样本数
+
+micro_batch：
+微批次大小，表示每个 DP 模型副本一次送入模型处理的样本数
